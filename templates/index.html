@@ -1,0 +1,963 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<title>CT DICOM Segmentation Viewer</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1f2330; --border:#2a2f3d;
+    --text:#e8eaf0; --muted:#8a90a3; --accent:#4f8cff;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg); color:var(--text); display:flex; height:100vh; overflow:hidden;
+  }
+  #statsPanel{
+    width:300px; min-width:300px; background:var(--panel); border-right:1px solid var(--border);
+    padding:18px; overflow-y:auto;
+  }
+  #sidebar{
+    width:340px; min-width:340px; background:var(--panel); border-left:1px solid var(--border);
+    padding:18px; overflow-y:auto;
+  }
+  #sidebar h2, #statsPanel h2{font-size:15px; margin:0 0 14px; color:var(--text);}
+  .section{margin-bottom:18px; padding-bottom:16px; border-bottom:1px solid var(--border);}
+  .section:last-child{border-bottom:none;}
+  .section-title{display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;}
+  label{display:block; font-size:11px; color:var(--muted); margin-bottom:6px; text-transform:uppercase; letter-spacing:.04em;}
+  input[type=file]{width:100%; font-size:12px; color:var(--muted);}
+  input[type=range]{width:100%;}
+  select{
+    width:100%; background:var(--panel2); border:1px solid var(--border); color:var(--text);
+    border-radius:6px; padding:6px 8px; font-size:12px;
+  }
+  .row{display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;}
+  .val{font-size:12px; color:var(--accent); font-variant-numeric:tabular-nums;}
+  button{
+    cursor:pointer; border:1px solid var(--border); background:var(--panel2); color:var(--text);
+    border-radius:8px; padding:8px 10px; font-size:12px; margin-top:6px;
+    transition:background .15s, border-color .15s;
+  }
+  button:hover{background:#262b3a;}
+  button.active{border-color:var(--accent); background:rgba(79,140,255,.15); color:#cfe0ff;}
+  button.primary{border-color:var(--accent); background:var(--accent); color:#fff; width:100%;}
+  button.primary:hover{background:#3f78e0;}
+  button.danger{border-color:#ff4d4f; color:#ffb3b4;}
+  button.danger:hover{background:rgba(255,77,79,.15);}
+  button:disabled{opacity:.4; cursor:not-allowed;}
+  button.iconbtn{padding:4px 7px; margin:0; font-size:12px; line-height:1;}
+  .btn-row{display:flex; gap:6px;}
+  .btn-row button{flex:1; margin-top:0;}
+  .hint{font-size:11px; color:var(--muted); margin-top:6px; line-height:1.4;}
+
+  #main{flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; position:relative; min-width:0;}
+  #dropzone{
+    width:70%; max-width:520px; border:2px dashed var(--border); border-radius:14px; padding:60px 20px;
+    text-align:center; color:var(--muted); cursor:pointer;
+  }
+  #dropzone:hover{border-color:var(--accent); color:var(--text);}
+  #viewer{display:none; width:100%; height:100%; flex-direction:column; align-items:center; justify-content:center;}
+  #viewport{
+    position:relative; width:94%; height:82vh; overflow:hidden; border:1px solid var(--border);
+    border-radius:10px; background:#000; cursor:crosshair;
+  }
+  #canvasWrap{ position:absolute; top:0; left:0; transform-origin:0 0; }
+  #baseImage{display:block; image-rendering:pixelated; user-select:none; pointer-events:none;}
+  #overlayCanvas{position:absolute; top:0; left:0;}
+  #status{position:absolute; top:14px; left:14px; font-size:12px; color:var(--muted); background:rgba(0,0,0,.55); padding:6px 10px; border-radius:6px; z-index:5;}
+  #status.error{color:#ff8080;}
+  #loadingOverlay{
+    display:none; position:absolute; inset:0; background:rgba(15,17,21,.5);
+    align-items:center; justify-content:center; font-size:14px; color:var(--text); z-index:6;
+  }
+  #hintBar{width:94%; margin-top:10px; font-size:11px; color:var(--muted); line-height:1.5; text-align:center;}
+
+  /* ---- stats panel ---- */
+  .info-line{display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px; color:var(--text);}
+  .info-line span:first-child{color:var(--muted);}
+  .stat-row{display:flex; align-items:center; gap:8px; margin-bottom:10px;}
+  .swatch{width:12px; height:12px; border-radius:3px; flex:none;}
+  .stat-body{flex:1; min-width:0;}
+  .stat-label{font-size:12px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .stat-area{font-size:11px; color:var(--muted);}
+  .empty-hint{font-size:11px; color:var(--muted); font-style:italic;}
+
+  /* ---- mask list (sidebar) ---- */
+  .slice-chip-list{display:flex; flex-direction:column; gap:3px; max-height:150px; overflow-y:auto;}
+  .slice-item{
+    display:flex; align-items:center; gap:4px; background:var(--panel2); border:1px solid var(--border);
+    border-radius:6px; padding:3px 4px 3px 8px; font-size:11px;
+  }
+  .slice-item:hover{border-color:var(--accent);}
+  .slice-item.current{border-color:var(--accent); background:rgba(79,140,255,.15);}
+  .slice-item-main{flex:1; min-width:0; display:flex; align-items:center; gap:6px; cursor:pointer; overflow:hidden;}
+  .slice-item-idx{flex:none; color:var(--accent); font-variant-numeric:tabular-nums;}
+  .slice-item-name{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text);}
+  .slice-item-name.empty{color:var(--muted); font-style:italic;}
+  .slice-item-badge{flex:none; font-size:10px; color:var(--muted);}
+
+  .mask-row{
+    display:flex; align-items:center; gap:6px; padding:6px 4px; border-radius:6px; margin-bottom:2px;
+  }
+  .mask-row.selected{background:rgba(79,140,255,.12); outline:1px solid var(--accent);}
+  .mask-row.builtin{opacity:.92;}
+  .mask-toggle{width:16px; height:16px; cursor:pointer; flex:none;}
+  .mask-color-btn{
+    width:18px; height:18px; border-radius:4px; border:1px solid rgba(255,255,255,.3); cursor:pointer; flex:none; padding:0;
+  }
+  .mask-label{
+    flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    font-size:12px; cursor:pointer; background:none; border:none; color:var(--text); text-align:left; padding:2px 4px;
+  }
+  .mask-label:hover{color:var(--accent);}
+  .mask-badge{
+    flex:none; font-size:9px; color:var(--muted); border:1px solid var(--border); border-radius:4px;
+    padding:1px 4px; text-transform:uppercase; letter-spacing:.03em;
+  }
+  .mask-actions{display:flex; gap:2px; flex:none;}
+  .colorpicker-hidden{width:0; height:0; opacity:0; position:absolute; pointer-events:none;}
+
+  #sliceSliderWrap{width:94%; margin-top:10px; display:flex; align-items:center; gap:10px;}
+  #sliceSliderVal{min-width:72px; text-align:right; font-size:11px; color:var(--accent); font-variant-numeric:tabular-nums;}
+
+  .filter-chip-list{display:flex; flex-wrap:wrap; gap:6px; margin-top:6px;}
+  .filter-chip{
+    display:flex; align-items:center; gap:5px; background:var(--panel2); border:1px solid var(--border);
+    border-radius:6px; padding:3px 6px 3px 8px; font-size:11px;
+  }
+  .filter-chip button{margin:0; padding:0 2px; font-size:11px; border:none; background:none; color:#ff8080;}
+</style>
+</head>
+<body>
+
+<!-- ===================== LEFT: THỐNG KÊ ===================== -->
+<div id="statsPanel">
+  <h2>📊 Thống kê diện tích</h2>
+  <div class="section">
+    <div class="info-line"><span>Slide</span><span id="infoSlice">–</span></div>
+    <div class="info-line"><span>WL / WW</span><span id="infoWlWw">–</span></div>
+    <div class="info-line"><span>Khoảng HU</span><span id="infoHu">–</span></div>
+  </div>
+  <div class="section" style="border-bottom:none;">
+    <label>Diện tích mask trên slide này</label>
+    <div id="statsContent"><div class="empty-hint">Chưa có dữ liệu.</div></div>
+  </div>
+</div>
+
+<!-- ===================== CENTER: CANVAS ===================== -->
+<div id="main">
+  <div id="dropzone">
+    <div>📁 Kéo thả hoặc bấm để chọn file .zip chứa DICOM</div>
+    <input type="file" id="fileInput" accept=".zip" style="margin-top:14px; display: none;">
+  </div>
+  <div id="viewer">
+    <div id="viewport">
+      <div id="canvasWrap">
+        <img id="baseImage" src="">
+        <canvas id="overlayCanvas"></canvas>
+      </div>
+      <div id="status"></div>
+      <div id="loadingOverlay">Đang xử lý…</div>
+    </div>
+    <div id="sliceSliderWrap">
+      <input type="range" id="sliceSlider" min="0" max="0" value="0">
+      <span id="sliceSliderVal">0 / 0</span>
+    </div>
+    <div id="hintBar">
+      Lăn chuột: đổi slide · Giữ chuột giữa + kéo: di chuyển ảnh · Ctrl+Z: hoàn tác thao tác mask gần nhất<br>
+      Chế độ "Chỉnh ảnh": giữ trái + kéo dọc = đổi độ sáng (WL), giữ Ctrl = đổi độ tương phản (WW); giữ phải + kéo = zoom quanh điểm bấm
+    </div>
+  </div>
+</div>
+
+<!-- ===================== RIGHT: SETTINGS ===================== -->
+<div id="sidebar">
+  <h2 id="caseTitle">🩻 CT Segmentation</h2>
+
+  <div class="section">
+    <label>Chọn file DICOM (.zip)</label>
+    <input type="file" id="fileInput2" accept=".zip" style="display: none;">
+  </div>
+
+  <div class="section">
+    <div class="section-title"><label style="margin:0;">Slide có mask / có tên</label></div>
+    <div class="slice-chip-list" id="sliceChipList"><span class="empty-hint">Chưa có mask hoặc tên nào.</span></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">
+      <label style="margin:0;">Danh sách mask</label>
+      <button class="iconbtn" id="addMaskBtn" title="Thêm mask mới">➕</button>
+    </div>
+    <div id="maskList"><span class="empty-hint">Chưa có mask.</span></div>
+    <input type="color" id="hiddenColorInput" class="colorpicker-hidden">
+  </div>
+
+  <div class="section">
+    <label>Mask đang chọn: chỉ có (include)</label>
+    <select id="includeSelect"><option value="">— chọn mask để thêm —</option></select>
+    <div class="filter-chip-list" id="includeChips"></div>
+  </div>
+
+  <div class="section">
+    <label>Mask đang chọn: loại trừ (exclude)</label>
+    <select id="excludeSelect"><option value="">— chọn mask để thêm —</option></select>
+    <div class="filter-chip-list" id="excludeChips"></div>
+  </div>
+
+  <div class="section">
+    <label>Chế độ thao tác chuột</label>
+    <div class="btn-row">
+      <button id="modeAddBtn" class="active">➕ Thêm</button>
+      <button id="modeSubBtn">➖ Trừ</button>
+      <button id="modeAdjustBtn">🖌️ Chỉnh ảnh</button>
+    </div>
+  </div>
+
+  <div class="section" id="toolSection">
+    <label>Công cụ vẽ (chỉ áp dụng khi ở chế độ Thêm/Trừ)</label>
+    <div class="btn-row">
+      <button id="toolFloodBtn" class="active">🪣 Flood fill</button>
+      <button id="toolManualBtn">✏️ Khoanh tay</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <label>Tolerance (flood fill)</label>
+    <div class="row"><span></span><span class="val" id="toleranceVal">10</span></div>
+    <input type="range" id="toleranceSlider" min="0" max="80" value="10">
+  </div>
+
+  <div class="section">
+    <label>Reset mask</label>
+    <div class="btn-row">
+      <button id="clearColorMaskBtn">🧹 Xóa mask đang chọn (slide này)</button>
+    </div>
+    <div class="btn-row">
+      <button id="clearMaskBtn">🗑️ Xóa tất cả mask (slide này)</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <label>Chỉnh sửa hình thái (mask đang chọn)</label>
+    <div class="row"><span>Số lần lặp (px)</span><span class="val" id="denoiseVal">1</span></div>
+    <input type="range" id="denoiseSlider" min="0" max="10" value="1">
+    <button id="denoiseBtn">✨ Nối vùng / làm mượt biên</button>
+    <button id="removeSmallNoiseBtn">🔬 Xóa đốm nhiễu nhỏ</button>
+  </div>
+
+  <div class="section" style="border-bottom:none;">
+    <label>Xuất kết quả</label>
+    <button class="primary" id="exportSegBtn">⬇️ Xuất DICOM-SEG</button>
+  </div>
+</div>
+
+<script>
+// ============================================================================
+// State
+// ============================================================================
+let numSlices = 0, currentSlice = 0, imgW = 0, imgH = 0;
+let masks = [];                // [{id,label,color:[r,g,b],visible,include,exclude}]
+let selectedMaskId = null;
+let sliceMode = 'add';         // 'add' | 'subtract' | 'adjust'
+let tool = 'flood';            // 'flood' | 'manual'
+let isDrawing = false, lassoPoints = [];
+
+let scale = 1, panX = 0, panY = 0;
+let dragState = null;          // {type:'hu'|'zoom'|'pan'|'flood'|'lasso', ...}
+let huAtDragStart = {min:0, max:0};
+
+const COLOR_HEX = c => '#' + c.map(v => v.toString(16).padStart(2,'0')).join('');
+
+// ============================================================================
+// DOM refs
+// ============================================================================
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const fileInput2 = document.getElementById('fileInput2');
+const viewer = document.getElementById('viewer');
+const viewport = document.getElementById('viewport');
+const canvasWrap = document.getElementById('canvasWrap');
+const baseImage = document.getElementById('baseImage');
+const overlayCanvas = document.getElementById('overlayCanvas');
+const ctx = overlayCanvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const loadingOverlay = document.getElementById('loadingOverlay');
+const caseTitle = document.getElementById('caseTitle');
+
+const sliceChipList = document.getElementById('sliceChipList');
+const maskListEl = document.getElementById('maskList');
+const hiddenColorInput = document.getElementById('hiddenColorInput');
+const includeSelect = document.getElementById('includeSelect');
+const excludeSelect = document.getElementById('excludeSelect');
+const includeChips = document.getElementById('includeChips');
+const excludeChips = document.getElementById('excludeChips');
+
+const modeAddBtn = document.getElementById('modeAddBtn');
+const modeSubBtn = document.getElementById('modeSubBtn');
+const modeAdjustBtn = document.getElementById('modeAdjustBtn');
+const toolFloodBtn = document.getElementById('toolFloodBtn');
+const toolManualBtn = document.getElementById('toolManualBtn');
+const toolSection = document.getElementById('toolSection');
+
+const toleranceSlider = document.getElementById('toleranceSlider');
+const toleranceVal = document.getElementById('toleranceVal');
+const denoiseSlider = document.getElementById('denoiseSlider');
+const denoiseVal = document.getElementById('denoiseVal');
+const denoiseBtn = document.getElementById('denoiseBtn');
+const removeSmallNoiseBtn = document.getElementById('removeSmallNoiseBtn');
+const clearColorMaskBtn = document.getElementById('clearColorMaskBtn');
+const clearMaskBtn = document.getElementById('clearMaskBtn');
+const exportSegBtn = document.getElementById('exportSegBtn');
+const addMaskBtn = document.getElementById('addMaskBtn');
+
+const sliceSlider = document.getElementById('sliceSlider');
+const sliceSliderVal = document.getElementById('sliceSliderVal');
+
+const infoSlice = document.getElementById('infoSlice');
+const infoWlWw = document.getElementById('infoWlWw');
+const infoHu = document.getElementById('infoHu');
+const statsContent = document.getElementById('statsContent');
+
+// ============================================================================
+// Upload
+// ============================================================================
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.style.borderColor = 'var(--accent)'; });
+dropzone.addEventListener('dragleave', () => { dropzone.style.borderColor = ''; });
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => { if (fileInput.files.length) uploadFile(fileInput.files[0]); });
+fileInput2.addEventListener('change', () => { if (fileInput2.files.length) uploadFile(fileInput2.files[0]); });
+
+function uploadFile(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  setStatus('Đang tải & xử lý DICOM…');
+  showLoading(true);
+  fetch('/upload', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(data => {
+      showLoading(false);
+      if (!data.success) { setStatus(data.error, true); return; }
+      numSlices = data.num_slices; imgW = data.width; imgH = data.height;
+      currentSlice = data.slice_index;
+      masks = data.masks; selectedMaskId = data.default_mask_id;
+      caseTitle.textContent = '🩻 ' + (data.case_name || 'CT Segmentation');
+
+      dropzone.style.display = 'none';
+      viewer.style.display = 'flex';
+
+      setImage(data.image, true);
+      renderMaskList();
+      sliceEntriesCache = data.slice_entries || [];
+      renderSliceChips(sliceEntriesCache);
+      setupSliceSlider();
+      fetchStats();
+      setStatus(`Đã tải ${numSlices} ảnh (${imgW}x${imgH}).`);
+    })
+    .catch(err => { showLoading(false); setStatus('Lỗi: ' + err.message, true); });
+}
+
+// ============================================================================
+// Hiển thị ảnh + canvas center / zoom / pan
+// ============================================================================
+function setImage(dataUrl, resetView) {
+  baseImage.onload = () => {
+    overlayCanvas.width = baseImage.naturalWidth;
+    overlayCanvas.height = baseImage.naturalHeight;
+    canvasWrap.style.width = baseImage.naturalWidth + 'px';
+    canvasWrap.style.height = baseImage.naturalHeight + 'px';
+    if (resetView) centerImage();
+    applyTransform();
+  };
+  baseImage.src = dataUrl;
+}
+
+function centerImage() {
+  const vw = viewport.clientWidth, vh = viewport.clientHeight;
+  scale = Math.min(vw / imgW, vh / imgH, 1) || 1;
+  panX = (vw - imgW * scale) / 2;
+  panY = (vh - imgH * scale) / 2;
+}
+
+function applyTransform() {
+  canvasWrap.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+}
+
+function clientToImageCoords(clientX, clientY) {
+  const rect = viewport.getBoundingClientRect();
+  const localX = clientX - rect.left, localY = clientY - rect.top;
+  return { x: (localX - panX) / scale, y: (localY - panY) / scale };
+}
+
+// ============================================================================
+// Mode / tool buttons
+// ============================================================================
+function setSliceMode(m) {
+  sliceMode = m;
+  [modeAddBtn, modeSubBtn, modeAdjustBtn].forEach(b => b.classList.remove('active'));
+  ({add: modeAddBtn, subtract: modeSubBtn, adjust: modeAdjustBtn})[m].classList.add('active');
+  toolSection.style.opacity = (m === 'adjust') ? .4 : 1;
+  viewport.style.cursor = (m === 'adjust') ? 'move' : 'crosshair';
+}
+modeAddBtn.addEventListener('click', () => setSliceMode('add'));
+modeSubBtn.addEventListener('click', () => setSliceMode('subtract'));
+modeAdjustBtn.addEventListener('click', () => setSliceMode('adjust'));
+
+function setTool(t) {
+  tool = t;
+  toolFloodBtn.classList.toggle('active', t === 'flood');
+  toolManualBtn.classList.toggle('active', t === 'manual');
+}
+toolFloodBtn.addEventListener('click', () => setTool('flood'));
+toolManualBtn.addEventListener('click', () => setTool('manual'));
+
+toleranceSlider.addEventListener('input', () => toleranceVal.textContent = toleranceSlider.value);
+denoiseSlider.addEventListener('input', () => denoiseVal.textContent = denoiseSlider.value);
+
+// ============================================================================
+// Mask list (sidebar)
+// ============================================================================
+function renderMaskList() {
+  if (!masks.length) { maskListEl.innerHTML = '<span class="empty-hint">Chưa có mask.</span>'; }
+  else {
+    maskListEl.innerHTML = masks.map(m => `
+      <div class="mask-row ${m.id === selectedMaskId ? 'selected' : ''}" data-mask-id="${m.id}" style="display:none">${m.id}</div>
+    `).join('');
+    maskListEl.innerHTML = '';
+    masks.forEach(m => {
+      const isBuiltin = m.status === 'builtin';
+      const row = document.createElement('div');
+      row.className = 'mask-row' + (m.id === selectedMaskId ? ' selected' : '') + (isBuiltin ? ' builtin' : '');
+      row.dataset.maskId = m.id;
+      const deleteBtnHtml = isBuiltin
+        ? `<button class="iconbtn" data-act="delete" title="Mask có sẵn (builtin) - không thể xóa" disabled>🔒</button>`
+        : `<button class="iconbtn" data-act="delete" title="Xóa mask">🗑️</button>`;
+      row.innerHTML = `
+        <input type="checkbox" class="mask-toggle" ${m.visible ? 'checked' : ''} title="Hiện/ẩn">
+        <button class="mask-color-btn" style="background:${COLOR_HEX(m.color)}" title="Đổi màu"></button>
+        <button class="mask-label" title="Chọn để sửa">${escapeHtml(m.label)}</button>
+        ${isBuiltin ? '<span class="mask-badge" title="Mask có sẵn">builtin</span>' : ''}
+        <span class="mask-actions">
+          <button class="iconbtn" data-act="rename" title="Đổi tên">✏️</button>
+          ${deleteBtnHtml}
+        </span>`;
+      // hidden mask id for backend requests
+      row.setAttribute('data-mid', m.id);
+
+      row.querySelector('.mask-toggle').addEventListener('change', e => toggleVisibility(m.id, e.target.checked));
+      row.querySelector('.mask-color-btn').addEventListener('click', () => openColorPicker(m.id, m.color));
+      row.querySelector('.mask-label').addEventListener('click', () => selectMask(m.id));
+      row.querySelector('[data-act=rename]').addEventListener('click', () => renameMask(m.id, m.label));
+      if (!isBuiltin) {
+        row.querySelector('[data-act=delete]').addEventListener('click', () => deleteMask(m.id));
+      }
+      maskListEl.appendChild(row);
+    });
+  }
+  renderFilterUI();
+}
+
+function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function selectMask(mid) {
+  selectedMaskId = mid;
+  renderMaskList();
+}
+
+function openColorPicker(mid, color) {
+  hiddenColorInput.value = COLOR_HEX(color);
+  hiddenColorInput.onchange = () => {
+    const hex = hiddenColorInput.value;
+    const rgb = [1,3,5].map(i => parseInt(hex.substr(i,2), 16));
+    fetch('/recolor_mask', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({mask_id: mid, color: rgb, slice_index: currentSlice})
+    }).then(r=>r.json()).then(data => {
+      if (!data.success) { setStatus(data.error, true); return; }
+      masks = data.masks; setImage(data.image, false); renderMaskList(); fetchStats();
+    });
+  };
+  hiddenColorInput.click();
+}
+
+function toggleVisibility(mid, visible) {
+  fetch('/toggle_mask_visibility', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mask_id: mid, visible, slice_index: currentSlice})
+  }).then(r=>r.json()).then(data => {
+    if (!data.success) { setStatus(data.error, true); return; }
+    masks = data.masks; setImage(data.image, false); fetchStats();
+  });
+}
+
+function renameMask(mid, oldLabel) {
+  const label = prompt('Tên mới cho mask:', oldLabel);
+  if (label === null || !label.trim()) return;
+  fetch('/rename_mask', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mask_id: mid, label: label.trim()})
+  }).then(r=>r.json()).then(data => {
+    if (!data.success) { setStatus(data.error, true); return; }
+    masks = data.masks; renderMaskList(); fetchStats();
+  });
+}
+
+function deleteMask(mid) {
+  const m = masks.find(x => x.id === mid);
+  if (m && m.status === 'builtin') { setStatus('Không thể xóa mask có sẵn (builtin).', true); return; }
+  if (!confirm(`Xóa mask "${m ? m.label : mid}"? Thao tác này sẽ xóa mask này trên TẤT CẢ các slide và không thể hoàn tác.`)) return;
+  fetch('/delete_mask', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mask_id: mid, slice_index: currentSlice})
+  }).then(r=>r.json()).then(data => {
+    if (!data.success) { setStatus(data.error, true); return; }
+    masks = data.masks;
+    if (selectedMaskId === mid) selectedMaskId = masks.length ? masks[0].id : null;
+    setImage(data.image, false);
+    renderMaskList();
+    sliceEntriesCache = data.slice_entries || sliceEntriesCache;
+    renderSliceChips(sliceEntriesCache);
+    fetchStats();
+  });
+}
+
+addMaskBtn.addEventListener('click', () => {
+  fetch('/create_mask', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({}) })
+    .then(r=>r.json()).then(data => {
+      if (!data.success) { setStatus(data.error, true); return; }
+      masks = data.masks; selectedMaskId = data.mask_id; renderMaskList(); fetchStats();
+    });
+});
+
+// ---- include / exclude filter UI (gắn theo selectedMaskId) ----
+function renderFilterUI() {
+  const options = masks.filter(m => m.id !== selectedMaskId);
+  const fillSelect = (sel) => {
+    sel.innerHTML = '<option value="">— chọn mask để thêm —</option>' +
+      options.map(m => `<option value="${m.id}">${escapeHtml(m.label)}</option>`).join('');
+  };
+  fillSelect(includeSelect); fillSelect(excludeSelect);
+
+  const cur = masks.find(m => m.id === selectedMaskId);
+  const renderChips = (container, ids, kind) => {
+    if (!ids || !ids.length) { container.innerHTML = '<span class="empty-hint">Trống.</span>'; return; }
+    container.innerHTML = ids.map(id => {
+      const mm = masks.find(x => x.id === id);
+      return `<span class="filter-chip" data-id="${id}">${escapeHtml(mm ? mm.label : id)}<button data-kind="${kind}" data-id="${id}">✕</button></span>`;
+    }).join('');
+    container.querySelectorAll('button').forEach(btn => {
+      btn.addEventListener('click', () => removeFilterItem(btn.dataset.kind, btn.dataset.id));
+    });
+  };
+  renderChips(includeChips, cur ? cur.include : [], 'include');
+  renderChips(excludeChips, cur ? cur.exclude : [], 'exclude');
+}
+
+function updateFilters(include, exclude) {
+  if (!selectedMaskId) return;
+  fetch('/set_mask_filters', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mask_id: selectedMaskId, include, exclude})
+  }).then(r=>r.json()).then(data => {
+    if (!data.success) { setStatus(data.error, true); return; }
+    masks = data.masks; renderFilterUI();
+  });
+}
+
+includeSelect.addEventListener('change', () => {
+  const id = includeSelect.value; if (!id || !selectedMaskId) return;
+  const cur = masks.find(m => m.id === selectedMaskId);
+  const list = Array.from(new Set([...(cur.include||[]), id]));
+  updateFilters(list, cur.exclude || []);
+  includeSelect.value = '';
+});
+excludeSelect.addEventListener('change', () => {
+  const id = excludeSelect.value; if (!id || !selectedMaskId) return;
+  const cur = masks.find(m => m.id === selectedMaskId);
+  const list = Array.from(new Set([...(cur.exclude||[]), id]));
+  updateFilters(cur.include || [], list);
+  excludeSelect.value = '';
+});
+function removeFilterItem(kind, id) {
+  const cur = masks.find(m => m.id === selectedMaskId);
+  if (!cur) return;
+  if (kind === 'include') updateFilters((cur.include||[]).filter(x => x !== id), cur.exclude || []);
+  else updateFilters(cur.include || [], (cur.exclude||[]).filter(x => x !== id));
+}
+
+// ---- danh sách slide có mask và/hoặc có tên ----
+let sliceEntriesCache = [];
+
+function renderSliceChips(list) {
+  if (!list.length) { sliceChipList.innerHTML = '<span class="empty-hint">Chưa có mask hoặc tên nào.</span>'; return; }
+  sliceChipList.innerHTML = '';
+  list.forEach(entry => {
+    const idx = entry.index;
+    const hasName = !!entry.name;
+    const row = document.createElement('div');
+    row.className = 'slice-item' + (idx === currentSlice ? ' current' : '');
+    row.dataset.idx = idx;
+    row.innerHTML = `
+      <span class="slice-item-main">
+        <span class="slice-item-idx">#${idx}</span>
+        <span class="slice-item-name ${hasName ? '' : 'empty'}">${hasName ? escapeHtml(entry.name) : '(chưa đặt tên)'}</span>
+        ${entry.has_mask ? '<span class="slice-item-badge" title="Có mask">●</span>' : ''}
+      </span>
+      <span class="mask-actions">
+        <button class="iconbtn" data-act="rename" title="Đặt/đổi tên slide">✏️</button>
+        ${hasName ? '<button class="iconbtn" data-act="clearname" title="Xóa tên slide">🗑️</button>' : ''}
+      </span>`;
+    row.querySelector('.slice-item-main').addEventListener('click', () => goToSlice(idx));
+    row.querySelector('[data-act=rename]').addEventListener('click', () => renameSlide(idx, entry.name));
+    const clearBtn = row.querySelector('[data-act=clearname]');
+    if (clearBtn) clearBtn.addEventListener('click', () => clearSlideName(idx));
+    sliceChipList.appendChild(row);
+  });
+}
+
+function renameSlide(idx, oldName) {
+  const name = prompt('Tên cho slide #' + idx + ':', oldName || '');
+  if (name === null || !name.trim()) return;
+  fetch('/rename_slide', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({slice_index: idx, name: name.trim()})
+  }).then(r=>r.json()).then(data => {
+    if (!data.success) { setStatus(data.error, true); return; }
+    sliceEntriesCache = data.slice_entries || sliceEntriesCache;
+    renderSliceChips(sliceEntriesCache);
+  });
+}
+
+function clearSlideName(idx) {
+  fetch('/delete_slide_name', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({slice_index: idx})
+  }).then(r=>r.json()).then(data => {
+    if (!data.success) { setStatus(data.error, true); return; }
+    sliceEntriesCache = data.slice_entries || sliceEntriesCache;
+    renderSliceChips(sliceEntriesCache);
+  });
+}
+
+// ---- slider di chuyển nhanh giữa các slide ----
+function setupSliceSlider() {
+  sliceSlider.min = 0;
+  sliceSlider.max = Math.max(0, numSlices - 1);
+  sliceSlider.value = currentSlice;
+  updateSliceSliderLabel();
+}
+function updateSliceSliderLabel() {
+  sliceSliderVal.textContent = `${currentSlice} / ${Math.max(0, numSlices - 1)}`;
+}
+sliceSlider.addEventListener('input', () => goToSlice(parseInt(sliceSlider.value, 10)));
+
+// ============================================================================
+// Điều hướng slide
+// ============================================================================
+function goToSlice(idx) {
+  idx = Math.max(0, Math.min(numSlices - 1, idx));
+  sliceSlider.value = idx;
+  updateSliceSliderLabelFor(idx);
+  if (idx === currentSlice) return;
+  currentSlice = idx;
+  fetch('/get_slice', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({slice_index: idx}) })
+    .then(r=>r.json()).then(data => {
+      if (!data.success) { setStatus(data.error, true); return; }
+      setImage(data.image, false);
+      fetchStats();
+      renderSliceChips(sliceEntriesCache);
+    });
+}
+function updateSliceSliderLabelFor(idx) {
+  sliceSliderVal.textContent = `${idx} / ${Math.max(0, numSlices - 1)}`;
+}
+
+viewport.addEventListener('wheel', e => {
+  if (numSlices === 0) return;
+  e.preventDefault();
+  goToSlice(currentSlice + (e.deltaY > 0 ? 1 : -1));
+}, { passive: false });
+
+// ============================================================================
+// Mouse interactions: adjust (HU/zoom), pan, flood, lasso
+// ============================================================================
+viewport.addEventListener('contextmenu', e => e.preventDefault());
+
+viewport.addEventListener('mousedown', e => {
+  if (numSlices === 0) return;
+
+  if (e.button === 1) { // middle = pan
+    e.preventDefault();
+    dragState = { type: 'pan', startClientX: e.clientX, startClientY: e.clientY, startPanX: panX, startPanY: panY };
+    return;
+  }
+
+  if (sliceMode === 'adjust') {
+    if (e.button === 0) {
+      dragState = { type: 'hu', startClientY: e.clientY, startHuMin: huAtDragStart.min, startHuMax: huAtDragStart.max };
+    } else if (e.button === 2) {
+      dragState = {
+        type: 'zoom', anchorX: e.clientX, anchorY: e.clientY,
+        startScale: scale, startPanX: panX, startPanY: panY,
+      };
+    }
+    return;
+  }
+
+  // add / subtract mode
+  if (e.button === 0) {
+    if (tool === 'flood') {
+      dragState = { type: 'flood', startClientX: e.clientX, startClientY: e.clientY };
+    } else if (tool === 'manual') {
+      isDrawing = true; lassoPoints = [clientToImageCoords(e.clientX, e.clientY)];
+      clearOverlay();
+    }
+  }
+});
+
+window.addEventListener('mousemove', e => {
+  if (isDrawing && tool === 'manual') {
+    lassoPoints.push(clientToImageCoords(e.clientX, e.clientY));
+    drawLassoPreview();
+    return;
+  }
+  if (!dragState) return;
+
+  if (dragState.type === 'pan') {
+    panX = dragState.startPanX + (e.clientX - dragState.startClientX);
+    panY = dragState.startPanY + (e.clientY - dragState.startClientY);
+    applyTransform();
+  } else if (dragState.type === 'zoom') {
+    const deltaY = dragState.anchorY - e.clientY; // kéo lên = zoom in
+    const factor = Math.exp(deltaY * 0.006);
+    const newScale = Math.max(0.15, Math.min(10, dragState.startScale * factor));
+    panX = dragState.anchorX - (dragState.anchorX - dragState.startPanX) * (newScale / dragState.startScale);
+    panY = dragState.anchorY - (dragState.anchorY - dragState.startPanY) * (newScale / dragState.startScale);
+    scale = newScale;
+    applyTransform();
+  } else if (dragState.type === 'hu') {
+    const deltaY = dragState.startClientY - e.clientY;
+    if (e.ctrlKey || e.metaKey) {
+      const width = Math.max(1, (dragState.startHuMax - dragState.startHuMin) + deltaY * 2);
+      const level = (dragState.startHuMin + dragState.startHuMax) / 2;
+      requestHuWindow(level - width/2, level + width/2);
+    } else {
+      const shift = -deltaY * 2;
+      requestHuWindow(dragState.startHuMin + shift, dragState.startHuMax + shift);
+    }
+  } else if (dragState.type === 'flood') {
+    const dx = e.clientX - dragState.startClientX, dy = e.clientY - dragState.startClientY;
+    if (Math.hypot(dx, dy) > 4) dragState.moved = true; // vượt ngưỡng -> không tính là click
+  }
+});
+
+window.addEventListener('mouseup', e => {
+  if (isDrawing && tool === 'manual') {
+    isDrawing = false;
+    clearOverlay();
+    if (lassoPoints.length >= 3) doMaskModify({ mode: 'manual', points: lassoPoints.map(p => [p.x, p.y]) });
+    lassoPoints = [];
+    return;
+  }
+  if (dragState && dragState.type === 'flood' && !dragState.moved) {
+    const { x, y } = clientToImageCoords(e.clientX, e.clientY);
+    doMaskModify({ mode: 'floodfill', x, y, tolerance: parseFloat(toleranceSlider.value) });
+  }
+  if (dragState && dragState.type === 'hu') {
+    huAtDragStart.min = STATE_hu_min; huAtDragStart.max = STATE_hu_max;
+  }
+  dragState = null;
+});
+
+let STATE_hu_min = 0, STATE_hu_max = 0, huDebounce = null;
+function requestHuWindow(min, max) {
+  if (min >= max) return;
+  clearTimeout(huDebounce);
+  huDebounce = setTimeout(() => {
+    fetch('/set_hu_window', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({slice_index: currentSlice, hu_min: min, hu_max: max})
+    }).then(r=>r.json()).then(data => {
+      if (!data.success) return;
+      STATE_hu_min = data.hu_min; STATE_hu_max = data.hu_max;
+      setImage(data.image, false);
+      fetchStats();
+    });
+  }, 15);
+}
+
+function drawLassoPreview() {
+  clearOverlay();
+  if (lassoPoints.length < 2) return;
+  ctx.beginPath();
+  ctx.moveTo(lassoPoints[0].x, lassoPoints[0].y);
+  for (let i = 1; i < lassoPoints.length; i++) ctx.lineTo(lassoPoints[i].x, lassoPoints[i].y);
+  const m = masks.find(x => x.id === selectedMaskId);
+  ctx.strokeStyle = m ? COLOR_HEX(m.color) : '#ffffff';
+  ctx.lineWidth = 2 / scale; ctx.setLineDash([4/scale, 3/scale]); ctx.stroke(); ctx.setLineDash([]);
+}
+function clearOverlay() { ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height); }
+
+// ============================================================================
+// Mask modify + undo
+// ============================================================================
+function doMaskModify(op) {
+  if (!selectedMaskId) { setStatus('Chưa chọn mask nào để vẽ.', true); return; }
+  setStatus('Đang cập nhật mask…');
+  showLoading(true);
+  fetch('/mask_modify', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      slice_index: currentSlice, mask_id: selectedMaskId, mask_mode: sliceMode,
+      ...op,
+    })
+  }).then(r=>r.json()).then(data => {
+    showLoading(false);
+    if (!data.success) { setStatus(data.error, true); return; }
+    setImage(data.image, false);
+    setStatus(`Cập nhật mask xong (${data.region_pixels} px).`);
+    sliceEntriesCache = data.slice_entries || sliceEntriesCache;
+    renderSliceChips(sliceEntriesCache);
+    fetchStats();
+  }).catch(err => { showLoading(false); setStatus('Lỗi: ' + err.message, true); });
+}
+
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+    e.preventDefault();
+    if (!selectedMaskId || numSlices === 0) return;
+    fetch('/undo_mask', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({slice_index: currentSlice, mask_id: selectedMaskId})
+    }).then(r=>r.json()).then(data => {
+      if (!data.success) { setStatus(data.error, true); return; }
+      if (data.undone) { setImage(data.image, false); fetchStats(); setStatus('Đã hoàn tác.'); }
+      else setStatus(data.message || 'Không có gì để hoàn tác.');
+    });
+  }
+});
+
+// ============================================================================
+// Clear / denoise
+// ============================================================================
+clearColorMaskBtn.addEventListener('click', () => {
+  if (!selectedMaskId) { setStatus('Chưa chọn mask.', true); return; }
+  fetch('/clear_color_mask', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({slice_index: currentSlice, mask_id: selectedMaskId})
+  }).then(r=>r.json()).then(data => {
+    if (!data.success) { setStatus(data.error, true); return; }
+    setImage(data.image, false);
+    sliceEntriesCache = data.slice_entries || sliceEntriesCache;
+    renderSliceChips(sliceEntriesCache);
+    fetchStats();
+  });
+});
+
+clearMaskBtn.addEventListener('click', () => {
+  if (!confirm('Xóa TẤT CẢ mask trên slide này?')) return;
+  fetch('/clear_mask', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({slice_index: currentSlice}) })
+    .then(r=>r.json()).then(data => {
+      if (!data.success) { setStatus(data.error, true); return; }
+      setImage(data.image, false);
+      sliceEntriesCache = data.slice_entries || sliceEntriesCache;
+      renderSliceChips(sliceEntriesCache);
+      fetchStats();
+    });
+});
+
+denoiseBtn.addEventListener('click', () => {
+  if (!selectedMaskId) { setStatus('Chưa chọn mask.', true); return; }
+  fetch('/denoise_mask', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({slice_index: currentSlice, mask_id: selectedMaskId, iterations: parseInt(denoiseSlider.value,10)})
+  }).then(r=>r.json()).then(data => {
+    if (!data.success) { setStatus(data.error, true); return; }
+    setImage(data.image, false); fetchStats();
+  });
+});
+
+removeSmallNoiseBtn.addEventListener('click', () => {
+  if (!selectedMaskId) { setStatus('Chưa chọn mask.', true); return; }
+  fetch('/remove_small_noise', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({slice_index: currentSlice, mask_id: selectedMaskId, iterations: parseInt(denoiseSlider.value,10)})
+  }).then(r=>r.json()).then(data => {
+    if (!data.success) { setStatus(data.error, true); return; }
+    setImage(data.image, false); fetchStats();
+  });
+});
+
+exportSegBtn.addEventListener('click', () => {
+  if (numSlices === 0) return;
+  setStatus('Đang xuất file DICOM-SEG…');
+  showLoading(true);
+  fetch('/export_dicom_seg', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
+    .then(async (r) => {
+      showLoading(false);
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({error: 'Lỗi không xác định'}));
+        setStatus(err.error || 'Lỗi xuất file.', true);
+        return;
+      }
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'segmentation.dcm';
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      setStatus('Đã xuất file DICOM-SEG.');
+    })
+    .catch(err => { showLoading(false); setStatus('Lỗi xuất file: ' + err.message, true); });
+});
+
+// ============================================================================
+// Stats
+// ============================================================================
+function fetchStats() {
+  if (numSlices === 0) return;
+  fetch('/get_stats', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({slice_index: currentSlice}) })
+    .then(r=>r.json()).then(data => {
+      if (!data.success) return;
+      STATE_hu_min = data.hu_min; STATE_hu_max = data.hu_max;
+      huAtDragStart.min = data.hu_min; huAtDragStart.max = data.hu_max;
+      infoSlice.textContent = `${data.slice_index} / ${data.num_slices - 1}`;
+      infoWlWw.textContent = `${data.wl} / ${data.ww}`;
+      infoHu.textContent = `${data.hu_min} .. ${data.hu_max}`;
+      renderStats(data.stats);
+    }).catch(() => {});
+}
+
+function renderStats(stats) {
+  if (!stats.length) { statsContent.innerHTML = '<div class="empty-hint">Chưa có mask nào.</div>'; return; }
+  statsContent.innerHTML = stats.map(s => `
+    <div class="stat-row">
+      <span class="swatch" style="background:${COLOR_HEX(s.color)}"></span>
+      <div class="stat-body">
+        <div class="stat-label">${escapeHtml(s.label)}</div>
+        <div class="stat-area">${s.total_pixels} px · ${s.total_area_mm2} mm² · ${s.total_area_cm2} cm²</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+// ============================================================================
+// Utils
+// ============================================================================
+function setStatus(msg, isError = false) {
+  statusEl.textContent = msg;
+  statusEl.classList.toggle('error', !!isError);
+}
+function showLoading(show) { loadingOverlay.style.display = show ? 'flex' : 'none'; }
+window.addEventListener('resize', () => { if (numSlices) applyTransform(); });
+
+setSliceMode('add');
+setTool('flood');
+</script>
+</body>
+</html>
