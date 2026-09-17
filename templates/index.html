@@ -220,13 +220,20 @@
     <div class="btn-row">
       <button id="toolFloodBtn" class="active">🪣 Flood fill</button>
       <button id="toolManualBtn">✏️ Khoanh tay</button>
+      <button id="toolBrushBtn">🖍️ Brush</button>
     </div>
   </div>
 
-  <div class="section">
+  <div class="section" id="toleranceSection">
     <label>Tolerance (flood fill)</label>
     <div class="row"><span></span><span class="val" id="toleranceVal">10</span></div>
     <input type="range" id="toleranceSlider" min="0" max="80" value="10">
+  </div>
+
+  <div class="section" id="brushSizeSection" style="display:none;">
+    <label>Brush size (px)</label>
+    <div class="row"><span></span><span class="val" id="brushSizeVal">20</span></div>
+    <input type="range" id="brushSizeSlider" min="2" max="120" value="20">
   </div>
 
   <div class="section">
@@ -261,8 +268,9 @@ let numSlices = 0, currentSlice = 0, imgW = 0, imgH = 0;
 let masks = [];                // [{id,label,color:[r,g,b],visible,include,exclude}]
 let selectedMaskId = null;
 let sliceMode = 'add';         // 'add' | 'subtract' | 'adjust'
-let tool = 'flood';            // 'flood' | 'manual'
+let tool = 'flood';            // 'flood' | 'manual' | 'brush'
 let isDrawing = false, lassoPoints = [];
+let isBrushDown = false, brushStrokePoints = [], brushSize = 20, lastBrushPt = null;
 
 let scale = 1, panX = 0, panY = 0;
 let dragState = null;          // {type:'hu'|'zoom'|'pan'|'flood'|'lasso', ...}
@@ -299,10 +307,15 @@ const modeSubBtn = document.getElementById('modeSubBtn');
 const modeAdjustBtn = document.getElementById('modeAdjustBtn');
 const toolFloodBtn = document.getElementById('toolFloodBtn');
 const toolManualBtn = document.getElementById('toolManualBtn');
+const toolBrushBtn = document.getElementById('toolBrushBtn');
 const toolSection = document.getElementById('toolSection');
 
+const toleranceSection = document.getElementById('toleranceSection');
 const toleranceSlider = document.getElementById('toleranceSlider');
 const toleranceVal = document.getElementById('toleranceVal');
+const brushSizeSection = document.getElementById('brushSizeSection');
+const brushSizeSlider = document.getElementById('brushSizeSlider');
+const brushSizeVal = document.getElementById('brushSizeVal');
 const denoiseSlider = document.getElementById('denoiseSlider');
 const denoiseVal = document.getElementById('denoiseVal');
 const denoiseBtn = document.getElementById('denoiseBtn');
@@ -412,12 +425,19 @@ function setTool(t) {
   tool = t;
   toolFloodBtn.classList.toggle('active', t === 'flood');
   toolManualBtn.classList.toggle('active', t === 'manual');
+  toolBrushBtn.classList.toggle('active', t === 'brush');
+  toleranceSection.style.display = (t === 'flood') ? '' : 'none';
+  brushSizeSection.style.display = (t === 'brush') ? '' : 'none';
+  isBrushDown = false; brushStrokePoints = [];
+  clearOverlay();
 }
 toolFloodBtn.addEventListener('click', () => setTool('flood'));
 toolManualBtn.addEventListener('click', () => setTool('manual'));
+toolBrushBtn.addEventListener('click', () => setTool('brush'));
 
 toleranceSlider.addEventListener('input', () => toleranceVal.textContent = toleranceSlider.value);
 denoiseSlider.addEventListener('input', () => denoiseVal.textContent = denoiseSlider.value);
+brushSizeSlider.addEventListener('input', () => { brushSize = parseFloat(brushSizeSlider.value); brushSizeVal.textContent = brushSizeSlider.value; });
 
 // ============================================================================
 // Mask list (sidebar)
@@ -716,6 +736,13 @@ viewport.addEventListener('mousedown', e => {
     } else if (tool === 'manual') {
       isDrawing = true; lassoPoints = [clientToImageCoords(e.clientX, e.clientY)];
       clearOverlay();
+    } else if (tool === 'brush') {
+      isBrushDown = true;
+      const pt = clientToImageCoords(e.clientX, e.clientY);
+      brushStrokePoints = [pt];
+      lastBrushPt = pt;
+      clearOverlay();
+      drawBrushDot(pt);
     }
   }
 });
@@ -724,6 +751,20 @@ window.addEventListener('mousemove', e => {
   if (isDrawing && tool === 'manual') {
     lassoPoints.push(clientToImageCoords(e.clientX, e.clientY));
     drawLassoPreview();
+    return;
+  }
+  if (tool === 'brush' && sliceMode !== 'adjust' && numSlices > 0) {
+    const pt = clientToImageCoords(e.clientX, e.clientY);
+    const rect = viewport.getBoundingClientRect();
+    const inside = e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom;
+    if (!inside) { clearOverlay(); return; }
+    if (isBrushDown) {
+      brushStrokePoints.push(pt);
+      drawBrushSegment(lastBrushPt, pt);   // nối điểm cũ -> điểm mới, vẽ tiếp vào overlay (không clear) -> thành 1 đường cong liền
+      lastBrushPt = pt;
+    } else {
+      drawBrushPreview(pt);                // chỉ hover: xóa rồi vẽ 1 vòng tròn theo vị trí chuột
+    }
     return;
   }
   if (!dragState) return;
@@ -764,6 +805,16 @@ window.addEventListener('mouseup', e => {
     lassoPoints = [];
     return;
   }
+  if (isBrushDown) {
+    isBrushDown = false;
+    clearOverlay();
+    if (brushStrokePoints.length >= 1) {
+      doMaskModify({ mode: 'brush', points: brushStrokePoints.map(p => [p.x, p.y]), brush_size: brushSize });
+    }
+    brushStrokePoints = [];
+    lastBrushPt = null;
+    return;
+  }
   if (dragState && dragState.type === 'flood' && !dragState.moved) {
     const { x, y } = clientToImageCoords(e.clientX, e.clientY);
     doMaskModify({ mode: 'floodfill', x, y, tolerance: parseFloat(toleranceSlider.value) });
@@ -802,6 +853,49 @@ function drawLassoPreview() {
   ctx.lineWidth = 2 / scale; ctx.setLineDash([4/scale, 3/scale]); ctx.stroke(); ctx.setLineDash([]);
 }
 function clearOverlay() { ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height); }
+
+function drawBrushPreview(pt) {
+  clearOverlay();
+  drawBrushDot(pt);
+}
+
+function brushColor() {
+  const m = masks.find(x => x.id === selectedMaskId);
+  return (sliceMode === 'subtract') ? '#ffffff' : (m ? COLOR_HEX(m.color) : '#ffffff');
+}
+
+// Vòng tròn đơn (dùng khi chỉ hover, chưa giữ chuột)
+function drawBrushDot(pt) {
+  const r = Math.max(1, brushSize / 2);
+  const color = brushColor();
+  ctx.beginPath();
+  ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2);
+  ctx.fillStyle = color + '55';
+  ctx.fill();
+  ctx.lineWidth = 2 / scale;
+  ctx.strokeStyle = color;
+  ctx.stroke();
+}
+
+// Đoạn nét liền nối điểm trước -> điểm hiện tại, KHÔNG clear overlay,
+// để khi kéo chuột các đoạn cộng dồn lại thành 1 đường cong theo đúng đường đi.
+function drawBrushSegment(from, to) {
+  const color = brushColor();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(1, brushSize);
+  ctx.strokeStyle = color + '55';
+  ctx.beginPath();
+  ctx.moveTo(from.x, from.y);
+  ctx.lineTo(to.x, to.y);
+  ctx.stroke();
+  // viền mảnh quanh vị trí chuột hiện tại để biết đang vẽ tới đâu
+  ctx.beginPath();
+  ctx.arc(to.x, to.y, Math.max(1, brushSize / 2), 0, Math.PI * 2);
+  ctx.lineWidth = 1.5 / scale;
+  ctx.strokeStyle = color;
+  ctx.stroke();
+}
 
 // ============================================================================
 // Mask modify + undo

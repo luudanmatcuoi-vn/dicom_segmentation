@@ -15,6 +15,9 @@ Status "buildin" vs "custom":
 - Mask "buildin" không thể bị xóa (delete_mask trả về False), luôn được hiển thị ở CUỐI danh sách
   nhưng vẫn có thể đổi tên/màu/ẩn-hiện như mask thường.
 
+Công cụ vẽ: flood fill (tự động lan theo HU), khoanh tay thủ công (polygon), và
+brush (vẽ tự do bằng vòng tròn theo đường di chuột, có brush size).
+
 Luồng sửa mask (route /mask_modify):
   existing = MaskStore.get_mask(slice, mask_id)          # lưu lại làm undo
   raw      = render_raw_img(slice)                       # ảnh HU windowed hiện tại
@@ -41,7 +44,7 @@ from PIL import Image
 from flask import Flask, request, jsonify, render_template, send_file
 
 from skimage.segmentation import flood
-from skimage.draw import polygon as sk_polygon
+from skimage.draw import polygon as sk_polygon, line as sk_line
 from skimage.morphology import dilation, erosion, disk
 from skimage.measure import label as sk_label, regionprops
 
@@ -75,9 +78,9 @@ class MaskStore:
         self.create_mask(label = "Mỡ nội tạng", color=DEFAULT_PALETTE[2], status="custom")
 
         # Tạo các mask buildin sẵn
-        self.create_mask(label = "_cơ_xương", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[29-34,29+34]}, {"opening":4}])
-        self.create_mask(label = "_mỡ_dưới_da", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[-93-23,-93+23]}, {"opening":4}])
-        self.create_mask(label = "_mỡ_nội_tạng", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[-74-23,-74+23]}, {"opening":4}])
+        self.create_mask(label = "_cơ_xương", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[29-34,29+34]}, {"opening":2}])
+        self.create_mask(label = "_mỡ_dưới_da", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[0-93-23,0-93+23]}, {"opening":0}])
+        self.create_mask(label = "_mỡ_nội_tạng", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[0-74-23,0-74+23]}, {"opening":0}])
 
     # ---- vòng đời mask ----
     def create_mask(self, label=None, color=None, status="custom", visible=True, special=None):
@@ -382,12 +385,59 @@ def render_final_img(slice_idx):
     return f"data:image/png;base64,{b64}"
 
 
+def brush_path_to_region(points, brush_size, h, w):
+    """
+    Tô 1 vùng boolean (H,W) từ đường đi con trỏ chuột (brush path), bằng cách
+    "dán" (stamp) 1 hình tròn bán kính brush_size/2 dọc theo đường đi, nối các
+    điểm liên tiếp bằng đoạn thẳng để không bị đứt quãng khi chuột di chuyển nhanh.
+    """
+    if len(points) < 1:
+        raise ValueError("Cần ít nhất 1 điểm để vẽ brush.")
+
+    radius = max(1, int(round(max(1.0, float(brush_size)) / 2)))
+    footprint = disk(radius).astype(bool)
+    fh, fw = footprint.shape
+    region = np.zeros((h, w), dtype=bool)
+
+    def stamp(cx, cy):
+        cx, cy = int(round(cx)), int(round(cy))
+        y0, x0 = cy - radius, cx - radius
+        y1, x1 = y0 + fh, x0 + fw
+        fy0, fx0, fy1, fx1 = 0, 0, fh, fw
+        if y0 < 0:
+            fy0 = -y0; y0 = 0
+        if x0 < 0:
+            fx0 = -x0; x0 = 0
+        if y1 > h:
+            fy1 -= (y1 - h); y1 = h
+        if x1 > w:
+            fx1 -= (x1 - w); x1 = w
+        if y0 >= y1 or x0 >= x1:
+            return
+        region[y0:y1, x0:x1] |= footprint[fy0:fy1, fx0:fx1]
+
+    step = max(1, radius // 2)
+    prev = None
+    for px, py in points:
+        if prev is not None:
+            rr, cc = sk_line(int(round(prev[1])), int(round(prev[0])), int(round(py)), int(round(px)))
+            for i in range(0, len(rr), step):
+                stamp(cc[i], rr[i])
+            stamp(cc[-1], rr[-1])
+        else:
+            stamp(px, py)
+        prev = (px, py)
+
+    return region
+
+
 def mask_handle(raw_img, op, exclude_arrays, include_arrays):
     """
     Tính vùng mới (boolean) từ thao tác flood fill / khoanh tay trên ảnh raw,
     sau đó áp post-process: trừ theo exclude_arrays, chỉ giữ trong include_arrays.
     op = {"mode": "floodfill", "x":.., "y":.., "tolerance":..}
       hoặc {"mode": "manual", "points": [[x,y],...]}
+      hoặc {"mode": "brush", "points": [[x,y],...], "brush_size": ..}
     """
     h, w = raw_img.shape
     mode = op.get("mode")
@@ -407,6 +457,8 @@ def mask_handle(raw_img, op, exclude_arrays, include_arrays):
         rr, cc = sk_polygon(ys, xs, shape=(h, w))
         region = np.zeros((h, w), dtype=bool)
         region[rr, cc] = True
+    elif mode == "brush":
+        region = brush_path_to_region(op.get("points", []), op.get("brush_size", 10), h, w)
     else:
         raise ValueError(f"mode không hợp lệ: {mode}")
 
@@ -765,6 +817,7 @@ def mask_modify():
             "x": data.get("x"), "y": data.get("y"),
             "tolerance": data.get("tolerance", 10),
             "points": data.get("points", []),
+            "brush_size": data.get("brush_size", 10),
         }
         handled = mask_handle(raw, op, exclude_arrays, include_arrays)
         new_mask = mask_muxing(existing, handled, mask_mode)
