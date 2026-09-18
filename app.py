@@ -48,7 +48,6 @@ from skimage.draw import polygon as sk_polygon, line as sk_line
 from skimage.morphology import dilation, erosion, disk
 from skimage.measure import label as sk_label, regionprops
 
-import highdicom as hd
 
 app = Flask(__name__)
 
@@ -78,9 +77,10 @@ class MaskStore:
         self.create_mask(label = "Mỡ nội tạng", color=DEFAULT_PALETTE[2], status="custom")
 
         # Tạo các mask buildin sẵn
-        self.create_mask(label = "_cơ_xương", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[29-34,29+34]}, {"opening":2}])
-        self.create_mask(label = "_mỡ_dưới_da", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[0-93-23,0-93+23]}, {"opening":0}])
-        self.create_mask(label = "_mỡ_nội_tạng", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[0-74-23,0-74+23]}, {"opening":0}])
+        self.create_mask(label = "_cơ_xương", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[29-24,29+24]}, {"opening":2}])
+        self.create_mask(label = "_mỡ_dưới_da", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[0-93-23,0-93+23]}, {"opening":4}])
+        self.create_mask(label = "_mỡ_nội_tạng", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[0-100,0-50]}, {"opening":1}])
+        self.create_mask(label = "_khí", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[-100000000,-200]}, {"opening":2}])
 
     # ---- vòng đời mask ----
     def create_mask(self, label=None, color=None, status="custom", visible=True, special=None):
@@ -497,7 +497,7 @@ def mask_open_close(temp_special_mask, op_key, op_value):
     iterations = int(op_value)
     mask_bool = temp_special_mask.astype(bool)
     footprint = disk(1)
-    if op_key == "opening":
+    if op_key == "closing":
         for _ in range(iterations):
             mask_bool = erosion(mask_bool, footprint)
         for _ in range(iterations):
@@ -1021,7 +1021,10 @@ def export_dicom_seg():
 
         if not has_any:
             return jsonify({"success": False, "error": "Chưa có mask nào có dữ liệu để xuất."}), 400
-
+        try:
+            import highdicom as hd
+        except:
+            return jsonify({"success": False, "error": "Chưa cài đặt thư viện highdicom. Hãy cài đặt Microsoft Visual C++ Build Tools."}), 400
         segment_descriptions = []
         for i, mid in enumerate(mask_ids):
             label_text = ms.meta[mid]["label"] or mid
