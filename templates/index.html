@@ -127,12 +127,51 @@
     border-radius:6px; padding:3px 6px 3px 8px; font-size:11px;
   }
   .filter-chip button{margin:0; padding:0 2px; font-size:11px; border:none; background:none; color:#ff8080;}
+
+  /* ---- nút giữ để ẩn mask ---- */
+  #peekMaskBtn{width:100%; margin-top:0; padding:10px; font-size:13px; user-select:none; -webkit-user-select:none; touch-action:none;}
+  #peekMaskBtn.pressing{border-color:var(--accent); background:rgba(79,140,255,.28); color:#fff;}
+  #peekImage{position:absolute; top:0; left:0; width:100%; height:100%; display:none; image-rendering:pixelated; user-select:none; pointer-events:none;}
+
+  /* ---- preset HU ---- */
+  .hu-preset-grid{display:grid; grid-template-columns:1fr 1fr; gap:6px;}
+  .hu-preset-btn{margin:0; display:flex; flex-direction:column; align-items:flex-start; gap:2px; text-align:left;}
+  .hu-preset-btn small{color:var(--muted); font-size:10px; font-variant-numeric:tabular-nums;}
+  .hu-preset-btn.active small{color:#cfe0ff;}
+  .hu-preset-btn:disabled small{color:var(--muted);}
+
+  /* ---- HU tại con trỏ (góc trái dưới viewport) ---- */
+  #huReadout{
+    display:none; position:absolute; left:14px; bottom:14px; z-index:5; pointer-events:none;
+    font-size:12px; color:#e8eaf0; background:rgba(0,0,0,.6); padding:5px 10px; border-radius:6px;
+    font-variant-numeric:tabular-nums; white-space:nowrap;
+  }
 </style>
 </head>
 <body>
 
 <!-- ===================== LEFT: THỐNG KÊ ===================== -->
 <div id="statsPanel">
+  <h2>🔍 Xem ảnh</h2>
+  <div class="section">
+    <label>Ẩn / hiện mask</label>
+    <button id="peekMaskBtn" disabled>👁️ Giữ để xem ảnh không mask</button>
+    <div class="hint">Nhấn giữ nút để xem ảnh gốc; thả chuột thì mask hiện lại.</div>
+  </div>
+  <div class="section">
+    <label>Cửa sổ HU nhanh (WL / WW)</label>
+    <div class="hu-preset-grid">
+      <button class="hu-preset-btn" data-wl="40"   data-ww="400">Mô mềm<small>WL 40 · WW 400</small></button>
+      <button class="hu-preset-btn" data-wl="40"   data-ww="80">Não<small>WL 40 · WW 80</small></button>
+      <button class="hu-preset-btn" data-wl="60"   data-ww="160">Gan<small>WL 60 · WW 160</small></button>
+      <button class="hu-preset-btn" data-wl="-100" data-ww="250">Mỡ<small>WL -100 · WW 250</small></button>
+      <button class="hu-preset-btn" data-wl="50"   data-ww="350">Trung thất<small>WL 50 · WW 350</small></button>
+      <button class="hu-preset-btn" data-wl="-600" data-ww="1500">Phổi<small>WL -600 · WW 1500</small></button>
+      <button class="hu-preset-btn" data-wl="400"  data-ww="1800">Xương<small>WL 400 · WW 1800</small></button>
+      <button class="hu-preset-btn" id="huResetBtn" data-wl="" data-ww="" disabled>Gốc DICOM<small>–</small></button>
+    </div>
+  </div>
+
   <h2>📊 Thống kê diện tích</h2>
   <div class="section">
     <div class="info-line"><span>Slide</span><span id="infoSlice">–</span></div>
@@ -155,9 +194,11 @@
     <div id="viewport">
       <div id="canvasWrap">
         <img id="baseImage" src="">
+        <img id="peekImage" alt="">
         <canvas id="overlayCanvas"></canvas>
       </div>
       <div id="status"></div>
+      <div id="huReadout"></div>
       <div id="loadingOverlay">Đang xử lý…</div>
     </div>
     <div id="sliceSliderWrap">
@@ -256,7 +297,8 @@
 
   <div class="section" style="border-bottom:none;">
     <label>Xuất kết quả</label>
-    <button class="primary" id="exportSegBtn">⬇️ Xuất DICOM-SEG</button>
+    <button class="primary" id="exportSegBtn">⬇️ Xuất DICOM (.zip)</button>
+    <div class="hint">Zip = toàn bộ file gốc + 1 file DICOM-SEG (mỗi mask custom có dữ liệu = 1 Segment: Number + Label). Không có mask custom thì xuất DICOM thường.</div>
   </div>
 </div>
 
@@ -277,6 +319,16 @@ let dragState = null;          // {type:'hu'|'zoom'|'pan'|'flood'|'lasso', ...}
 let huAtDragStart = {min:0, max:0};
 
 const COLOR_HEX = c => '#' + c.map(v => v.toString(16).padStart(2,'0')).join('');
+
+// --- nút giữ để ẩn mask ---
+let peekHeld = false, peekToken = 0;
+
+// --- HU tại con trỏ ---
+const HU_IDLE_MS = 500;          // slide phải đứng yên >500ms mới tự tải HU data
+const HU_CACHE_MAX = 16;         // giữ tối đa 16 slide (mỗi slide ~0.5MB với ảnh 512x512)
+const huCache = new Map();       // slice_index -> Int16Array (thứ tự chèn = LRU)
+const huPending = new Map();     // slice_index -> Promise (tránh gọi trùng)
+let huIdleTimer = null, huLoadEpoch = 0, lastPointer = null, huRaf = 0;
 
 // ============================================================================
 // DOM refs
@@ -324,6 +376,10 @@ const clearColorMaskBtn = document.getElementById('clearColorMaskBtn');
 const clearMaskBtn = document.getElementById('clearMaskBtn');
 const exportSegBtn = document.getElementById('exportSegBtn');
 const addMaskBtn = document.getElementById('addMaskBtn');
+const peekMaskBtn = document.getElementById('peekMaskBtn');
+const peekImage = document.getElementById('peekImage');
+const huReadout = document.getElementById('huReadout');
+const huResetBtn = document.getElementById('huResetBtn');
 
 const sliceSlider = document.getElementById('sliceSlider');
 const sliceSliderVal = document.getElementById('sliceSliderVal');
@@ -359,6 +415,9 @@ function uploadFile(file) {
       numSlices = data.num_slices; imgW = data.width; imgH = data.height;
       currentSlice = data.slice_index;
       masks = data.masks; selectedMaskId = data.default_mask_id;
+      stopPeek(); resetHuState();
+      peekMaskBtn.disabled = false;
+      setupResetPreset(data.hu_min, data.hu_max);
       caseTitle.textContent = '🩻 ' + (data.case_name || 'CT Segmentation');
 
       dropzone.style.display = 'none';
@@ -370,7 +429,11 @@ function uploadFile(file) {
       renderSliceChips(sliceEntriesCache);
       setupSliceSlider();
       fetchStats();
-      setStatus(`Đã tải ${numSlices} ảnh (${imgW}x${imgH}).`);
+      scheduleHuPrefetch();
+      let msg = `Đã tải ${numSlices} ảnh (${imgW}x${imgH}).`;
+      if (data.seg_loaded) msg += ` Đã nạp DICOM-SEG: ${data.seg_segments} segment (${data.seg_replaced} thay mask cùng tên, ${data.seg_new} mask mới), ${data.seg_frames} lát cắt có mask.`;
+      if (data.seg_warnings && data.seg_warnings.length) msg += ' ⚠ ' + data.seg_warnings.join(' | ');
+      setStatus(msg, !!(data.seg_warnings && data.seg_warnings.length));
     })
     .catch(err => { showLoading(false); setStatus('Lỗi: ' + err.message, true); });
 }
@@ -379,6 +442,7 @@ function uploadFile(file) {
 // Hiển thị ảnh + canvas center / zoom / pan
 // ============================================================================
 function setImage(dataUrl, resetView) {
+  if (peekHeld) requestPeekImage();       // đang giữ nút "ẩn mask" mà ảnh nền đổi (slide/HU) -> tải lại ảnh không mask
   baseImage.onload = () => {
     overlayCanvas.width = baseImage.naturalWidth;
     overlayCanvas.height = baseImage.naturalHeight;
@@ -685,6 +749,8 @@ function goToSlice(idx) {
   updateSliceSliderLabelFor(idx);
   if (idx === currentSlice) return;
   currentSlice = idx;
+  refreshHuReadout();       // đổi slide: cập nhật số HU (hiện "…" nếu chưa có data)
+  scheduleHuPrefetch();     // đứng yên > 500ms mới gọi get_hu_data
   fetch('/get_slice', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({slice_index: idx}) })
     .then(r=>r.json()).then(data => {
       if (!data.success) { setStatus(data.error, true); return; }
@@ -989,7 +1055,7 @@ removeSmallNoiseBtn.addEventListener('click', () => {
 
 exportSegBtn.addEventListener('click', () => {
   if (numSlices === 0) return;
-  setStatus('Đang xuất file DICOM-SEG…');
+  setStatus('Đang tạo file zip DICOM…');
   showLoading(true);
   fetch('/export_dicom_seg', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
     .then(async (r) => {
@@ -1000,12 +1066,16 @@ exportSegBtn.addEventListener('click', () => {
         return;
       }
       const blob = await r.blob();
+      const name = decodeURIComponent(r.headers.get('X-Download-Name') || 'export.zip');
+      const nSeg = parseInt(r.headers.get('X-Segments-Exported') || '0', 10);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url; a.download = 'segmentation.dcm';
+      a.href = url; a.download = name;
       document.body.appendChild(a); a.click(); a.remove();
       URL.revokeObjectURL(url);
-      setStatus('Đã xuất file DICOM-SEG.');
+      setStatus(nSeg > 0
+        ? `Đã xuất ${name}: DICOM gốc + DICOM-SEG (${nSeg} segment).`
+        : `Không có mask custom nào có dữ liệu → đã xuất ${name} (DICOM thường, không có SEG).`);
     })
     .catch(err => { showLoading(false); setStatus('Lỗi xuất file: ' + err.message, true); });
 });
@@ -1023,6 +1093,7 @@ function fetchStats() {
       infoSlice.textContent = `${data.slice_index} / ${data.num_slices - 1}`;
       infoWlWw.textContent = `${data.wl} / ${data.ww}`;
       infoHu.textContent = `${data.hu_min} .. ${data.hu_max}`;
+      highlightHuPreset(data.wl, data.ww);
       renderStats(data.stats);
     }).catch(() => {});
 }
@@ -1039,6 +1110,155 @@ function renderStats(stats) {
     </div>
   `).join('');
 }
+
+// ============================================================================
+// Nút giữ để ẩn mask: giữ chuột -> xin ảnh KHÔNG mask (/get_slice_nomask) và phủ lên canvas;
+// nhả chuột -> gỡ ảnh phủ. Không đụng tới các route/ảnh khác.
+// ============================================================================
+function requestPeekImage() {
+  const token = ++peekToken;
+  fetch('/get_slice_nomask', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({slice_index: currentSlice})
+  }).then(r => r.json()).then(data => {
+    if (!peekHeld || token !== peekToken) return;         // đã nhả chuột / có yêu cầu mới hơn
+    if (!data.success) { setStatus(data.error, true); return; }
+    peekImage.onload = () => { if (peekHeld && token === peekToken) peekImage.style.display = 'block'; };
+    peekImage.src = data.image;
+  }).catch(() => {});
+}
+
+function startPeek() {
+  if (numSlices === 0 || peekHeld) return;
+  peekHeld = true;
+  peekMaskBtn.classList.add('pressing');
+  requestPeekImage();
+}
+
+function stopPeek() {
+  peekToken++;                                            // hủy mọi phản hồi đang chờ
+  peekHeld = false;
+  peekMaskBtn.classList.remove('pressing');
+  peekImage.style.display = 'none';
+  peekImage.removeAttribute('src');
+}
+
+peekMaskBtn.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  try { peekMaskBtn.setPointerCapture(e.pointerId); } catch (_) {}
+  startPeek();
+});
+['pointerup', 'pointercancel', 'lostpointercapture'].forEach(ev => peekMaskBtn.addEventListener(ev, stopPeek));
+window.addEventListener('pointerup', stopPeek);
+window.addEventListener('blur', stopPeek);
+peekMaskBtn.addEventListener('contextmenu', e => e.preventDefault());
+peekMaskBtn.addEventListener('keydown', e => { if ((e.key === ' ' || e.key === 'Enter') && !e.repeat) { e.preventDefault(); startPeek(); } });
+peekMaskBtn.addEventListener('keyup',   e => { if (e.key === ' ' || e.key === 'Enter') stopPeek(); });
+
+// ============================================================================
+// Preset HU: mọi phần tử .hu-preset-btn -> đọc attribute data-wl / data-ww -> yêu cầu Flask render ảnh mới
+// (dùng lại /set_hu_window qua requestHuWindow)
+// ============================================================================
+document.querySelectorAll('.hu-preset-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (numSlices === 0) return;
+    const wl = parseFloat(btn.getAttribute('data-wl'));
+    const ww = parseFloat(btn.getAttribute('data-ww'));
+    if (!isFinite(wl) || !isFinite(ww) || ww <= 0) return;
+    requestHuWindow(wl - ww / 2, wl + ww / 2);
+  });
+});
+
+function setupResetPreset(huMin, huMax) {       // nút "Gốc DICOM": WL/WW của file vừa upload
+  const wl = Math.round((huMin + huMax) / 2 * 10) / 10, ww = Math.round((huMax - huMin) * 10) / 10;
+  huResetBtn.setAttribute('data-wl', wl);
+  huResetBtn.setAttribute('data-ww', ww);
+  huResetBtn.querySelector('small').textContent = `WL ${wl} · WW ${ww}`;
+  huResetBtn.disabled = false;
+}
+
+function highlightHuPreset(wl, ww) {
+  document.querySelectorAll('.hu-preset-btn').forEach(btn => {
+    const w = parseFloat(btn.getAttribute('data-wl')), h = parseFloat(btn.getAttribute('data-ww'));
+    btn.classList.toggle('active', isFinite(w) && isFinite(h) && Math.abs(w - wl) < 0.6 && Math.abs(h - ww) < 0.6);
+  });
+}
+
+// ============================================================================
+// HU tại con trỏ. Dữ liệu: /get_hu_data?slice_index=N -> nhị phân int16 little-endian (H*W, theo hàng).
+// Chỉ tải khi (1) slide đứng yên > 500ms, hoặc (2) con trỏ cần HU mà slide chưa có data.
+// ============================================================================
+function resetHuState() {
+  huLoadEpoch++;                                // vô hiệu hóa các request cũ còn đang bay
+  huCache.clear(); huPending.clear();
+  clearTimeout(huIdleTimer);
+  lastPointer = null;
+  huReadout.style.display = 'none';
+}
+
+function ensureHuData(slice) {
+  if (huCache.has(slice)) {
+    const arr = huCache.get(slice);
+    huCache.delete(slice); huCache.set(slice, arr);          // đánh dấu vừa dùng
+    return Promise.resolve(arr);
+  }
+  if (huPending.has(slice)) return huPending.get(slice);
+  const epoch = huLoadEpoch;
+  const p = fetch(`/get_hu_data?slice_index=${slice}`)
+    .then(r => { if (!r.ok) throw new Error('get_hu_data ' + r.status); return r.arrayBuffer(); })
+    .then(buf => {
+      if (epoch !== huLoadEpoch) return null;                // đã upload file khác trong lúc chờ
+      const arr = new Int16Array(buf);
+      if (arr.length !== imgW * imgH) throw new Error('HU data sai kích thước');
+      huCache.set(slice, arr);
+      while (huCache.size > HU_CACHE_MAX) huCache.delete(huCache.keys().next().value);
+      return arr;
+    })
+    .finally(() => { if (huPending.get(slice) === p) huPending.delete(slice); });
+  huPending.set(slice, p);
+  return p;
+}
+
+function scheduleHuPrefetch() {
+  clearTimeout(huIdleTimer);
+  const s = currentSlice;
+  huIdleTimer = setTimeout(() => {
+    if (s !== currentSlice) return;
+    ensureHuData(s).then(refreshHuReadout).catch(() => {});
+  }, HU_IDLE_MS);
+}
+
+function pointerImagePixel() {
+  if (!lastPointer || numSlices === 0) return null;
+  const { x, y } = clientToImageCoords(lastPointer.clientX, lastPointer.clientY);
+  const ix = Math.floor(x), iy = Math.floor(y);
+  return (ix < 0 || iy < 0 || ix >= imgW || iy >= imgH) ? null : { ix, iy };
+}
+
+function refreshHuReadout() {
+  const px = pointerImagePixel();
+  if (!px) { huReadout.style.display = 'none'; return; }
+  huReadout.style.display = 'block';
+  const arr = huCache.get(currentSlice);
+  huReadout.textContent = arr
+    ? `HU: ${arr[px.iy * imgW + px.ix]}  ·  (${px.ix}, ${px.iy})`
+    : `HU: …  ·  (${px.ix}, ${px.iy})`;
+}
+
+viewport.addEventListener('mousemove', e => {
+  lastPointer = { clientX: e.clientX, clientY: e.clientY };
+  if (huRaf) return;
+  huRaf = requestAnimationFrame(() => {
+    huRaf = 0;
+    refreshHuReadout();
+    // con trỏ đang cần HU nhưng slide chưa có data -> tải ngay
+    if (pointerImagePixel() && !huCache.has(currentSlice)) {
+      ensureHuData(currentSlice).then(refreshHuReadout).catch(() => {});
+    }
+  });
+});
+viewport.addEventListener('mouseleave', () => { lastPointer = null; huReadout.style.display = 'none'; });
 
 // ============================================================================
 // Utils

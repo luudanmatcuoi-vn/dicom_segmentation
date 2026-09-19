@@ -28,6 +28,29 @@ Luồng sửa mask (route /mask_modify):
 
 Undo (Ctrl+Z, route /undo_mask): chỉ áp dụng cho /mask_modify, chỉ 1 bước duy nhất,
 kiểm tra đúng (slice_index, mask_id) đang thao tác thì mới phục hồi.
+
+DICOM-SEG (chuẩn):
+- Upload zip: server LUÔN tạo 3 mask custom rỗng, rồi tìm file DICOM-SEG (SOP Class 1.2.840.10008.5.1.4.1.1.66.4).
+  Mỗi Segment: trùng tên với mask custom có sẵn -> ghi đè pixel + đổi màu theo SEG; không trùng -> tạo mask custom mới,
+  pixel được ánh xạ về đúng slice qua ReferencedSOPInstanceUID (dự phòng: ImagePositionPatient).
+- Export: trả về 1 file ZIP = TOÀN BỘ nội dung zip gốc (giữ nguyên byte) + 1 file DICOM-SEG mới
+  chứa các mask "custom" có dữ liệu (Segment Number 1..N, Segment Label = tên mask).
+  Các file SEG cũ đã được nạp vào state sẽ được thay bằng file SEG mới (tránh trùng lặp).
+  Không có mask custom nào có dữ liệu -> zip DICOM thường (không có SEG).
+
+Route mới:
+- /get_slice_nomask (POST) : ảnh của slide KHÔNG có mask (FE dùng cho nút "giữ để ẩn mask").
+- /get_hu_data      (GET)  : HU của 1 slide dạng nhị phân int16 little-endian, xem docstring của route.
+
+Tương thích OHIF Viewer (2 chiều, xem build_dicom_seg_bytes / import_seg_items):
+- Export: SEG dùng highdicom, ReferencedSeriesSequence/FrameOfReferenceUID lấy tự động từ
+  source_images nên OHIF (cornerstone-dicom-seg) đọc trực tiếp được khi mở cùng zip CT gốc.
+  omit_empty_frames=True để file nhẹ hơn; content_qualification=RESEARCH (nếu highdicom hỗ
+  trợ) để đánh dấu không phải kết quả lâm sàng chính thức. SegmentsOverlap để highdicom tự
+  suy ra từ dữ liệu thật (mask của tool có thể chồng pixel nhau).
+- Import: _is_seg_dataset nhận diện SEG qua SOPClassUID/Modality, dự phòng thêm bằng
+  SegmentSequence cho các file SEG thiếu field chuẩn (kể cả SEG do OHIF hoặc phần mềm khác
+  xuất ra, không chỉ SEG do chính tool này tạo).
 """
 import io
 import os
@@ -36,6 +59,9 @@ import zipfile
 import tempfile
 import shutil
 import base64
+import atexit
+import unicodedata
+from urllib.parse import quote
 
 import numpy as np
 import pydicom
@@ -71,16 +97,36 @@ class MaskStore:
         self.pixels = {}        # slice_idx -> {mask_id: np.uint8 (H,W)}
         self.slide_names = {}   # slice_idx(int) -> str
         self._next_id = 1
-        # tạo sẵn 3 mask buildin rỗng (3 màu mặc định) để dùng ngay
-        self.create_mask(label = "Cơ xương", color=DEFAULT_PALETTE[0], status="custom")
-        self.create_mask(label = "Mỡ dưới da", color=DEFAULT_PALETTE[1], status="custom")
-        self.create_mask(label = "Mỡ nội tạng", color=DEFAULT_PALETTE[2], status="custom")
+        # LUÔN tạo 3 mask custom rỗng mặc định (nếu zip có SEG cùng tên thì import_seg_items sẽ ghi đè lên)
+        self.add_default_custom_masks()
 
         # Tạo các mask buildin sẵn
         self.create_mask(label = "_cơ_xương", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[29-24,29+24]}, {"opening":2}])
         self.create_mask(label = "_mỡ_dưới_da", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[0-93-23,0-93+23]}, {"opening":4}])
         self.create_mask(label = "_mỡ_nội_tạng", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[0-100,0-50]}, {"opening":1}])
         self.create_mask(label = "_khí", color=DEFAULT_PALETTE[3], status="buildin", visible=False, special=[{"threshold":[-100000000,-200]}, {"opening":2}])
+
+    def add_default_custom_masks(self):
+        self.create_mask(label = "Cơ xương", color=DEFAULT_PALETTE[0], status="custom")
+        self.create_mask(label = "Mỡ dưới da", color=DEFAULT_PALETTE[1], status="custom")
+        self.create_mask(label = "Mỡ nội tạng", color=DEFAULT_PALETTE[2], status="custom")
+
+    @staticmethod
+    def _norm_label(label):
+        return unicodedata.normalize("NFC", str(label or "")).strip().casefold()
+
+    def find_custom_by_label(self, label, exclude=()):
+        """Mask custom có tên trùng (không phân biệt hoa/thường, khoảng trắng đầu/cuối), chưa nằm trong exclude."""
+        key = self._norm_label(label)
+        for mid, m in self.meta.items():
+            if m.get("status") == "custom" and mid not in exclude and self._norm_label(m["label"]) == key:
+                return mid
+        return None
+
+    def clear_mask_pixels(self, mask_id):
+        """Xóa dữ liệu pixel của 1 mask trên MỌI slide (giữ nguyên mask/tên/màu)."""
+        for sl in self.pixels.values():
+            sl.pop(mask_id, None)
 
     # ---- vòng đời mask ----
     def create_mask(self, label=None, color=None, status="custom", visible=True, special=None):
@@ -265,6 +311,8 @@ STATE = {
     "hu_max": 240.0,
     "hu_bounds": (-1024.0, 3071.0),
     "case_name": "",
+    "source_zip_path": None,          # bản sao zip gốc trên đĩa (để export zip = zip gốc + SEG)
+    "consumed_seg_entries": set(),    # tên entry SEG trong zip đã được nạp vào mask_store (sẽ bị thay khi export)
     "undo": {"mask_id": None, "slice_index": None, "mask_array": None},
 }
 
@@ -286,67 +334,299 @@ def _get_first(value, default=None):
         return default
 
 
-def load_dicom_series_from_zip(zip_path):
-    tmp_dir = tempfile.mkdtemp(prefix="dcm_")
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(tmp_dir)
+SEG_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.1.66.4"     # Segmentation Storage
+PRIVATE_CREATOR = "CTSEGAPP"                              # private block (0041,10xx) lưu metadata riêng của app
 
-        dcm_paths = []
-        for root, _, files in os.walk(tmp_dir):
-            for fn in files:
-                if not fn.startswith("."):
-                    dcm_paths.append(os.path.join(root, fn))
 
-        datasets = []
-        for p in dcm_paths:
+def _is_junk_entry(name):
+    parts = [p for p in name.replace("\\", "/").split("/") if p]
+    if not parts:
+        return True
+    return parts[0] == "__MACOSX" or any(p.startswith(".") for p in parts)
+
+
+def _is_seg_dataset(ds):
+    if str(getattr(ds, "SOPClassUID", "")) == SEG_SOP_CLASS_UID:
+        return True
+    if str(getattr(ds, "Modality", "")).upper() == "SEG":
+        return True
+    # Tín hiệu phụ: có SegmentSequence (đặc trưng riêng của DICOM-SEG) nhưng
+    # SOPClassUID/Modality bị thiếu hoặc không chuẩn (một số exporter bên thứ 3,
+    # kể cả OHIF ở vài phiên bản cũ, có thể ghi thiếu field này).
+    if getattr(ds, "SegmentSequence", None):
+        return True
+    return False
+
+
+def load_dicom_zip(zip_path):
+    """
+    Đọc zip (không giải nén ra đĩa). Tách:
+      - các slice ảnh (2D, có pixel data) -> raw_hu (Z,H,W) sắp theo vị trí z
+      - các file DICOM-SEG -> seg_items [(tên entry trong zip, dataset)]
+    """
+    image_items = []     # (ds, pixel_array)
+    seg_items = []       # (entry_name, ds)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for info in zf.infolist():
+            name = info.filename
+            if info.is_dir() or _is_junk_entry(name):
+                continue
             try:
-                ds = pydicom.dcmread(p, force=True)
-                if not hasattr(ds, "pixel_array"):
-                    continue
-                datasets.append(ds)
+                ds = pydicom.dcmread(io.BytesIO(zf.read(info)), force=True)
             except Exception:
                 continue
-
-        if not datasets:
-            raise ValueError("Không tìm thấy file DICOM hợp lệ trong zip.")
-
-        def sort_key(ds):
-            if hasattr(ds, "ImagePositionPatient") and len(ds.ImagePositionPatient) == 3:
-                return float(ds.ImagePositionPatient[2])
-            if hasattr(ds, "InstanceNumber"):
-                return float(ds.InstanceNumber)
-            return 0.0
-
-        datasets.sort(key=sort_key)
-
-        first = datasets[0]
-        wc = _get_first(getattr(first, "WindowCenter", None), 40.0)
-        ww = _get_first(getattr(first, "WindowWidth", None), 400.0)
-
-        ps = getattr(first, "PixelSpacing", None)
-        if ps and len(ps) == 2:
-            pixel_spacing = (float(ps[0]), float(ps[1]))
-        else:
-            pixel_spacing = (1.0, 1.0)
-
-        hu_slices = []
-        h0, w0 = datasets[0].pixel_array.shape
-        kept_datasets = []
-        for ds in datasets:
-            arr = ds.pixel_array
-            if arr.shape != (h0, w0):
+            if _is_seg_dataset(ds):
+                seg_items.append((name, ds))
                 continue
-            slope = float(getattr(ds, "RescaleSlope", 1.0))
-            intercept = float(getattr(ds, "RescaleIntercept", 0.0))
-            hu = arr.astype(np.float32) * slope + intercept
-            hu_slices.append(hu)
-            kept_datasets.append(ds)
+            try:
+                arr = ds.pixel_array
+            except Exception:
+                continue
+            if arr.ndim != 2:          # bỏ multi-frame / ảnh màu
+                continue
+            image_items.append((ds, arr))
 
-        raw_hu = np.stack(hu_slices, axis=0)
-        return raw_hu, kept_datasets, pixel_spacing, wc, ww
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    if not image_items:
+        raise ValueError("Không tìm thấy file DICOM ảnh hợp lệ trong zip.")
+
+    def sort_key(item):
+        ds = item[0]
+        if hasattr(ds, "ImagePositionPatient") and len(ds.ImagePositionPatient) == 3:
+            return float(ds.ImagePositionPatient[2])
+        if hasattr(ds, "InstanceNumber"):
+            return float(ds.InstanceNumber)
+        return 0.0
+
+    image_items.sort(key=sort_key)
+
+    first = image_items[0][0]
+    wc = _get_first(getattr(first, "WindowCenter", None), 40.0)
+    ww = _get_first(getattr(first, "WindowWidth", None), 400.0)
+
+    ps = getattr(first, "PixelSpacing", None)
+    if ps and len(ps) == 2:
+        pixel_spacing = (float(ps[0]), float(ps[1]))
+    else:
+        pixel_spacing = (1.0, 1.0)
+
+    h0, w0 = image_items[0][1].shape
+    hu_slices, kept_datasets = [], []
+    for ds, arr in image_items:
+        if arr.shape != (h0, w0):
+            continue
+        slope = float(getattr(ds, "RescaleSlope", 1.0))
+        intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+        hu_slices.append(arr.astype(np.float32) * slope + intercept)
+        kept_datasets.append(ds)
+
+    return {
+        "raw_hu": np.stack(hu_slices, axis=0),
+        "datasets": kept_datasets,
+        "pixel_spacing": pixel_spacing,
+        "wc": wc, "ww": ww,
+        "seg_items": seg_items,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Màu segment: RGB <-> CIELab (DICOM RecommendedDisplayCIELabValue, illuminant D50)
+# ----------------------------------------------------------------------------
+_D50 = np.array([0.96422, 1.0, 0.82521])
+_SRGB_TO_XYZ_D50 = np.array([[0.4360747, 0.3850649, 0.1430804],
+                             [0.2225045, 0.7168786, 0.0606169],
+                             [0.0139322, 0.0971045, 0.7141733]])
+_XYZ_D50_TO_SRGB = np.linalg.inv(_SRGB_TO_XYZ_D50)
+
+
+def cielab_dicom_to_rgb(v):
+    """[L,a,b] mã hóa uint16 theo DICOM -> (r,g,b) 0..255."""
+    L = v[0] * 100.0 / 65535.0
+    a = v[1] * 255.0 / 65535.0 - 128.0
+    b = v[2] * 255.0 / 65535.0 - 128.0
+    fy = (L + 16.0) / 116.0
+    fx, fz = fy + a / 500.0, fy - b / 200.0
+    finv = lambda t: t ** 3 if t ** 3 > 0.008856 else (t - 16.0 / 116.0) / 7.787
+    xyz = _D50 * np.array([finv(fx), finv(fy), finv(fz)])
+    lin = np.clip(_XYZ_D50_TO_SRGB @ xyz, 0.0, 1.0)
+    srgb = np.where(lin <= 0.0031308, 12.92 * lin, 1.055 * np.power(lin, 1 / 2.4) - 0.055)
+    return tuple(int(round(float(c) * 255)) for c in np.clip(srgb, 0, 1))
+
+
+def rgb_to_cielab_dicom(rgb):
+    """(r,g,b) 0..255 -> [L,a,b] mã hóa uint16 theo DICOM."""
+    c = np.array(rgb, dtype=np.float64) / 255.0
+    lin = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+    xyz = (_SRGB_TO_XYZ_D50 @ lin) / _D50
+    f = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16.0 / 116.0)
+    L, a, b = 116.0 * f[1] - 16.0, 500.0 * (f[0] - f[1]), 200.0 * (f[1] - f[2])
+    enc = lambda x: int(round(min(max(x, 0.0), 65535.0)))
+    return [enc(L / 100.0 * 65535.0), enc((a + 128.0) / 255.0 * 65535.0), enc((b + 128.0) / 255.0 * 65535.0)]
+
+
+# ----------------------------------------------------------------------------
+# Nạp DICOM-SEG -> MaskStore
+# ----------------------------------------------------------------------------
+def read_private_meta(ds):
+    """Metadata riêng của app (tên slide, màu RGB chính xác) trong private block 0041,10xx."""
+    try:
+        creator = ds.get((0x0041, 0x0010))
+        if creator is None or str(creator.value).strip() != PRIVATE_CREATOR:
+            return {}
+        elem = ds.get((0x0041, 0x1001))
+        if elem is None:
+            return {}
+        v = elem.value
+        if isinstance(v, bytes):
+            v = v.decode("utf-8", errors="ignore")
+        meta = json.loads(str(v).rstrip("\x00 "))
+        return meta if isinstance(meta, dict) else {}
+    except Exception:
+        return {}
+
+
+def _frame_to_slice_index(fg, sop_to_idx, ipps, tol):
+    """Xác định frame SEG thuộc slice nào: ưu tiên ReferencedSOPInstanceUID, dự phòng ImagePositionPatient."""
+    try:
+        ref = str(fg.DerivationImageSequence[0].SourceImageSequence[0].ReferencedSOPInstanceUID)
+        if ref in sop_to_idx:
+            return sop_to_idx[ref]
+    except Exception:
+        pass
+    try:
+        ipp = np.array([float(x) for x in fg.PlanePositionSequence[0].ImagePositionPatient])
+        d = np.linalg.norm(ipps - ipp, axis=1)
+        j = int(np.argmin(d))
+        if d[j] <= tol:
+            return j
+    except Exception:
+        pass
+    return None
+
+
+def import_seg_items(seg_items, datasets, store):
+    """
+    Nạp mọi DICOM-SEG tìm được vào store (store đã có sẵn 3 mask custom rỗng mặc định).
+    Với mỗi Segment:
+      - có mask custom trùng tên (SegmentLabel) -> GHI ĐÈ pixel của mask đó bằng segment và đổi theo màu của SEG;
+      - không trùng tên -> tạo mask custom mới.
+    Màu SEG: private meta > RecommendedDisplayCIELabValue (không có màu thì giữ màu mask cũ / palette).
+    Trả về dict: consumed (set tên entry đã nạp), warnings, n_segments, n_replaced, n_new, n_frames.
+    """
+    result = {"consumed": set(), "warnings": [], "n_segments": 0, "n_replaced": 0, "n_new": 0, "n_frames": 0}
+    claimed = set()      # mask đã bị 1 segment chiếm -> segment trùng tên tiếp theo sẽ tạo mask mới, không ghi đè lần nữa
+    if not seg_items:
+        return result
+
+    sop_to_idx = {str(ds.SOPInstanceUID): i for i, ds in enumerate(datasets) if hasattr(ds, "SOPInstanceUID")}
+    ipps = np.full((len(datasets), 3), 1e18)
+    for i, ds in enumerate(datasets):
+        p = getattr(ds, "ImagePositionPatient", None)
+        if p is not None and len(p) == 3:
+            ipps[i] = [float(x) for x in p]
+    zs = np.sort(ipps[ipps[:, 2] < 1e17][:, 2])
+    diffs = np.abs(np.diff(zs)) if len(zs) > 1 else np.array([])
+    diffs = diffs[diffs > 1e-6]
+    tol = 0.5 * float(np.median(diffs)) if len(diffs) else 0.5
+
+    for name, sds in seg_items:
+        short = os.path.basename(name)
+        created = []         # mask tạo mới
+        reused = []          # (mask_id, màu cũ) của mask mặc định bị ghi đè
+
+        def rollback():
+            for m in created:
+                store.delete_mask(m)
+            for m, old_color in reused:
+                store.recolor_mask(m, old_color)
+                store.clear_mask_pixels(m)
+                claimed.discard(m)
+
+        try:
+            if (int(sds.Rows), int(sds.Columns)) != (store.h, store.w):
+                result["warnings"].append(f"{short}: kích thước SEG khác ảnh, bỏ qua.")
+                continue
+            seg_seq = getattr(sds, "SegmentSequence", None)
+            if not seg_seq:
+                result["warnings"].append(f"{short}: không có SegmentSequence, bỏ qua.")
+                continue
+
+            priv = read_private_meta(sds)
+            priv_segments = priv.get("segments", {}) if isinstance(priv.get("segments"), dict) else {}
+
+            # 1) tạo mask cho từng Segment (theo SegmentNumber tăng dần)
+            num_to_mid = {}
+            for seg in sorted(seg_seq, key=lambda s: int(s.SegmentNumber)):
+                sn = int(seg.SegmentNumber)
+                label = str(getattr(seg, "SegmentLabel", "") or "").strip() or f"Segment {sn}"
+                color = None
+                pc = priv_segments.get(str(sn), {}).get("color")
+                if isinstance(pc, (list, tuple)) and len(pc) == 3:
+                    color = tuple(int(c) for c in pc)
+                if color is None:
+                    lab = getattr(seg, "RecommendedDisplayCIELabValue", None)
+                    if lab is not None and len(lab) == 3:
+                        color = cielab_dicom_to_rgb([int(x) for x in lab])
+                mid = store.find_custom_by_label(label, exclude=claimed)
+                if mid is not None:                       # trùng tên -> thay mask cũ, đổi màu theo SEG
+                    claimed.add(mid)
+                    reused.append((mid, store.meta[mid]["color"]))
+                    store.clear_mask_pixels(mid)
+                    if color is not None:
+                        store.recolor_mask(mid, color)
+                else:
+                    mid = store.create_mask(label=label, color=color, status="custom")
+                    created.append(mid)
+                num_to_mid[sn] = mid
+
+            # 2) đọc frame -> slice
+            frames = sds.pixel_array
+            if frames.ndim == 2:
+                frames = frames[None]
+            pf = getattr(sds, "PerFrameFunctionalGroupsSequence", None) or []
+            fractional = str(getattr(sds, "SegmentationType", "BINARY")).upper() == "FRACTIONAL"
+            thr = float(getattr(sds, "MaximumFractionalValue", 255)) / 2.0 if fractional else 0.0
+
+            mapped = unmapped = 0
+            for f in range(min(frames.shape[0], len(pf))):
+                fg = pf[f]
+                try:
+                    sn = int(fg.SegmentIdentificationSequence[0].ReferencedSegmentNumber)
+                except Exception:
+                    sn = next(iter(num_to_mid)) if len(num_to_mid) == 1 else None
+                idx = _frame_to_slice_index(fg, sop_to_idx, ipps, tol)
+                if sn not in num_to_mid or idx is None:
+                    unmapped += 1
+                    continue
+                mid = num_to_mid[sn]
+                binary = (frames[f] > thr)
+                store.set_mask(idx, mid, store.get_mask(idx, mid).astype(bool) | binary)
+                mapped += 1
+
+            if mapped == 0:      # SEG này không thuộc series đang mở -> hoàn tác, không nạp
+                rollback()
+                result["warnings"].append(f"{short}: không khớp slice nào của series, bỏ qua.")
+                continue
+            if unmapped:
+                result["warnings"].append(f"{short}: {unmapped} frame không khớp slice nào.")
+
+            # 3) tên slide (metadata riêng của app)
+            for k, v in (priv.get("slide_names") or {}).items():
+                try:
+                    if 0 <= int(k) < store.num_slices:
+                        store.set_slide_name(int(k), str(v))
+                except Exception:
+                    pass
+
+            result["consumed"].add(name)
+            result["n_segments"] += len(created) + len(reused)
+            result["n_replaced"] += len(reused)
+            result["n_new"] += len(created)
+            result["n_frames"] += mapped
+        except Exception as e:
+            rollback()
+            result["warnings"].append(f"{short}: lỗi đọc SEG ({e}).")
+    return result
 
 
 # ----------------------------------------------------------------------------
@@ -361,21 +641,22 @@ def render_raw_img(slice_idx):
     return windowed.astype(np.uint8)
 
 
-def render_final_img(slice_idx):
-    """Ảnh raw + trộn màu các mask đang visible -> base64 PNG."""
+def render_final_img(slice_idx, with_masks=True):
+    """Ảnh raw (+ trộn màu các mask đang visible nếu with_masks) -> base64 PNG."""
     gray = render_raw_img(slice_idx)
     rgb = np.stack([gray, gray, gray], axis=-1).astype(np.float64)
 
-    mask_store = STATE["mask_store"]
-    for mid, info in mask_store.get_display_masks(slice_idx).items():
-        if not info["visible"]:
-            continue
-        m = info["array"]
-        if not m.any():
-            continue
-        color = np.array(info["color"], dtype=np.float64)
-        idx_mask = m.astype(bool)
-        rgb[idx_mask] = (1 - MASK_ALPHA) * rgb[idx_mask] + MASK_ALPHA * color
+    if with_masks:
+        mask_store = STATE["mask_store"]
+        for mid, info in mask_store.get_display_masks(slice_idx).items():
+            if not info["visible"]:
+                continue
+            m = info["array"]
+            if not m.any():
+                continue
+            color = np.array(info["color"], dtype=np.float64)
+            idx_mask = m.astype(bool)
+            rgb[idx_mask] = (1 - MASK_ALPHA) * rgb[idx_mask] + MASK_ALPHA * color
 
     rgb = np.clip(rgb, 0, 255).astype(np.uint8)
     img = Image.fromarray(rgb, mode="RGB")
@@ -546,16 +827,18 @@ def upload():
         return jsonify({"success": False, "error": "Vui lòng chọn file .zip chứa các file DICOM."}), 400
 
     tmp_zip_fd, tmp_zip_path = tempfile.mkstemp(suffix=".zip")
+    keep_zip = False
     try:
         os.close(tmp_zip_fd)
         f.save(tmp_zip_path)
 
-        raw_hu, datasets, pixel_spacing, wc, ww = load_dicom_series_from_zip(tmp_zip_path)
+        loaded = load_dicom_zip(tmp_zip_path)
+        raw_hu, datasets = loaded["raw_hu"], loaded["datasets"]
+        pixel_spacing, wc, ww = loaded["pixel_spacing"], loaded["wc"], loaded["ww"]
         z, h, w = raw_hu.shape
 
         STATE["raw_hu"] = raw_hu
         STATE["datasets"] = datasets
-        STATE["mask_store"] = MaskStore(z, h, w)
         STATE["num_slices"] = z
         STATE["height"] = h
         STATE["width"] = w
@@ -565,14 +848,29 @@ def upload():
         STATE["case_name"] = os.path.splitext(f.filename)[0]
         STATE["undo"] = {"mask_id": None, "slice_index": None, "mask_array": None}
 
+        # ---- mask: nếu zip có DICOM-SEG thì nạp segment/mask/tên slide vào state ----
+        store = MaskStore(z, h, w)               # luôn có 3 mask custom rỗng
+        seg_info = import_seg_items(loaded["seg_items"], datasets, store)
+        STATE["mask_store"] = store
+        STATE["consumed_seg_entries"] = seg_info["consumed"]
+
+        # giữ bản sao zip gốc để export (zip gốc + SEG mới)
+        old_zip = STATE.get("source_zip_path")
+        STATE["source_zip_path"] = tmp_zip_path
+        keep_zip = True
+        if old_zip and old_zip != tmp_zip_path and os.path.exists(old_zip):
+            try:
+                os.remove(old_zip)
+            except OSError:
+                pass
+
         data_min = float(np.percentile(raw_hu, 0.1))
         data_max = float(np.percentile(raw_hu, 99.9))
         bound_lo = min(data_min, STATE["hu_min"] - 200, -1024.0)
         bound_hi = max(data_max, STATE["hu_max"] + 200, 1024.0)
         STATE["hu_bounds"] = (round(bound_lo), round(bound_hi))
 
-        # MaskStore.__init__ đã tự tạo sẵn 3 mask buildin rỗng -> chọn mask đầu tiên làm mặc định
-        default_mask_id = STATE["mask_store"].list_mask_ids()[0]
+        default_mask_id = store.list_mask_ids()[0]
 
         image_b64 = render_final_img(0)
 
@@ -589,15 +887,31 @@ def upload():
             "hu_bound_min": STATE["hu_bounds"][0],
             "hu_bound_max": STATE["hu_bounds"][1],
             "pixel_spacing": pixel_spacing,
-            "masks": STATE["mask_store"].to_summary(),
+            "masks": store.to_summary(),
             "default_mask_id": default_mask_id,
-            "slice_entries": STATE["mask_store"].list_slice_entries(),
+            "slice_entries": store.list_slice_entries(),
+            "seg_loaded": bool(seg_info["consumed"]),
+            "seg_segments": seg_info["n_segments"],
+            "seg_replaced": seg_info["n_replaced"],
+            "seg_new": seg_info["n_new"],
+            "seg_frames": seg_info["n_frames"],
+            "seg_warnings": seg_info["warnings"],
         })
     except Exception as e:
         return jsonify({"success": False, "error": f"Lỗi đọc DICOM: {str(e)}"}), 500
     finally:
-        if os.path.exists(tmp_zip_path):
+        if not keep_zip and os.path.exists(tmp_zip_path):
             os.remove(tmp_zip_path)
+
+
+@atexit.register
+def _cleanup_source_zip():
+    p = STATE.get("source_zip_path")
+    if p and os.path.exists(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
 
 @app.route("/get_slice", methods=["POST"])
@@ -609,6 +923,46 @@ def get_slice():
     idx = clamp_slice_idx(data.get("slice_index", 0))
     image_b64 = render_final_img(idx)
     return jsonify({"success": True, "slice_index": idx, "image": image_b64})
+
+
+@app.route("/get_slice_nomask", methods=["POST"])
+def get_slice_nomask():
+    """Ảnh của slide KHÔNG có mask (theo cửa sổ HU hiện tại). FE dùng cho nút 'giữ để ẩn mask'."""
+    err = require_volume_loaded()
+    if err:
+        return err
+    data = request.get_json(force=True)
+    idx = clamp_slice_idx(data.get("slice_index", 0))
+    return jsonify({"success": True, "slice_index": idx, "image": render_final_img(idx, with_masks=False)})
+
+
+@app.route("/get_hu_data", methods=["GET"])
+def get_hu_data():
+    """
+    HU của 1 slide, GET /get_hu_data?slice_index=N
+
+    Định dạng: body nhị phân thô (application/octet-stream), H*W giá trị int16 LITTLE-ENDIAN,
+    theo thứ tự hàng (row-major): phần tử thứ (y*W + x) là HU của pixel (x, y).
+    Kích thước nằm trong header: X-Width, X-Height, X-Slice-Index (ảnh 512x512 ~ 512 KB).
+
+      - JS   : new Int16Array(await res.arrayBuffer())[y * W + x]
+      - Flask: np.frombuffer(body, dtype="<i2").reshape(H, W)
+    HU được làm tròn về số nguyên và kẹp trong [-32768, 32767].
+    """
+    err = require_volume_loaded()
+    if err:
+        return err
+    try:
+        idx = clamp_slice_idx(request.args.get("slice_index", 0))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "slice_index không hợp lệ."}), 400
+    hu = np.clip(np.rint(STATE["raw_hu"][idx]), -32768, 32767).astype("<i2")
+    resp = app.response_class(hu.tobytes(), mimetype="application/octet-stream")
+    resp.headers["X-Width"] = str(STATE["width"])
+    resp.headers["X-Height"] = str(STATE["height"])
+    resp.headers["X-Slice-Index"] = str(idx)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/set_hu_window", methods=["POST"])
@@ -995,89 +1349,169 @@ def get_stats():
     })
 
 
+def build_dicom_seg_bytes(ms, datasets, export_ids):
+    """
+    Tạo 1 file DICOM-SEG (bytes) chứa các mask trong export_ids.
+    Segment Number = 1..N theo thứ tự export_ids, Segment Label = tên mask (tối đa 64 ký tự),
+    màu hiển thị = RecommendedDisplayCIELabValue (chuẩn DICOM) + RGB chính xác trong private tag của app.
+    Raise ImportError nếu chưa cài highdicom.
+    """
+    import highdicom as hd
+
+    z, h, w = STATE["num_slices"], STATE["height"], STATE["width"]
+    ch_of = {mid: i for i, mid in enumerate(export_ids)}
+    seg_array = np.zeros((z, h, w, len(export_ids)), dtype=np.uint8)
+    for sl_idx, d in ms.pixels.items():
+        for mid, arr in d.items():
+            ch = ch_of.get(mid)
+            if ch is not None:
+                seg_array[sl_idx, :, :, ch] = arr
+
+    # content_qualification là tham số tùy chọn tùy phiên bản highdicom; nếu bản
+    # cài đặt không có enum này thì bỏ qua để không làm hỏng luồng export hiện có.
+    extra_seg_kwargs = {}
+    if hasattr(hd, "ContentQualificationValues"):
+        extra_seg_kwargs["content_qualification"] = hd.ContentQualificationValues.RESEARCH
+
+    category = Code("85756007", "SCT", "Tissue")
+    segment_descriptions, priv_segments = [], {}
+    for i, mid in enumerate(export_ids):
+        meta = ms.meta[mid]
+        number = i + 1
+        label = (meta["label"] or "").strip()[:64] or f"Segment {number}"
+        desc = hd.seg.SegmentDescription(
+            segment_number=number,
+            segment_label=label,
+            segmented_property_category=category,
+            segmented_property_type=category,
+            algorithm_type=hd.seg.SegmentAlgorithmTypeValues.MANUAL,
+        )
+        desc.RecommendedDisplayCIELabValue = rgb_to_cielab_dicom(meta["color"])
+        segment_descriptions.append(desc)
+        priv_segments[str(number)] = {"label": label, "color": [int(c) for c in meta["color"]]}
+
+    series_numbers = [int(ds.SeriesNumber) for ds in datasets if getattr(ds, "SeriesNumber", None) not in (None, "")]
+    seg_dataset = hd.seg.Segmentation(
+        source_images=datasets,
+        pixel_array=seg_array,
+        segmentation_type=hd.seg.SegmentationTypeValues.BINARY,
+        segment_descriptions=segment_descriptions,
+        series_instance_uid=hd.UID(),
+        series_number=max(series_numbers, default=0) + 1,
+        sop_instance_uid=hd.UID(),
+        instance_number=1,
+        manufacturer="CT-Segmentation-App",
+        manufacturer_model_name="FlaskSegViewer",
+        software_versions="3.0",
+        device_serial_number="0001",
+        series_description=f"Segmentation ({len(export_ids)} segments)",
+        content_label="MANUAL_SEG",
+        content_description="Segmentation tao bang cong cu web",
+        # Các tham số dưới đây ghi rõ (thay vì để mặc định ngầm) để file SEG tương
+        # thích ổn định với OHIF (cornerstone-dicom-seg loader):
+        omit_empty_frames=True,                 # bỏ frame toàn 0 -> file nhẹ hơn, OHIF đọc nhanh hơn
+        # KHÔNG tự set SegmentsOverlap: highdicom tự tính từ seg_array thực tế
+        # (mask của tool có thể chồng pixel giữa các mask -> để lib tự phát hiện là đúng nhất).
+        **extra_seg_kwargs,
+    )
+    # nhãn tiếng Việt -> UTF-8
+    seg_dataset.SpecificCharacterSet = "ISO_IR 192"
+
+    # metadata riêng (tên slide + RGB chính xác) trong private block; viewer khác sẽ bỏ qua an toàn
+    extra_meta = {
+        "app": PRIVATE_CREATOR, "version": 3,
+        "slide_names": {str(k): v for k, v in ms.slide_names.items() if 0 <= int(k) < z},
+        "segments": priv_segments,
+    }
+    seg_dataset.add_new((0x0041, 0x0010), "LO", PRIVATE_CREATOR)
+    seg_dataset.add_new((0x0041, 0x1001), "UT", json.dumps(extra_meta))
+
+    buf = io.BytesIO()
+    seg_dataset.save_as(buf)
+    return buf.getvalue(), str(seg_dataset.SOPInstanceUID)
+
+
 @app.route("/export_dicom_seg", methods=["POST"])
 def export_dicom_seg():
-    """Xuất DICOM-SEG với số lượng segment ĐỘNG theo số mask hiện có."""
+    """
+    Xuất file ZIP = toàn bộ nội dung zip đã upload (giữ nguyên) + 1 file DICOM-SEG mới.
+    - Chỉ đưa vào SEG các mask 'custom' CÓ dữ liệu (mask buildin không xuất; mask custom rỗng bị bỏ qua).
+    - Không có mask nào như vậy -> zip DICOM thường (không thêm SEG).
+    - Các file SEG cũ đã nạp vào state được thay bằng SEG mới (state là bản mới nhất).
+    Header phản hồi: X-Download-Name (url-encoded), X-Segments-Exported (số segment).
+    """
     err = require_volume_loaded()
     if err:
         return err
+    src_zip = STATE.get("source_zip_path")
+    if not src_zip or not os.path.exists(src_zip):
+        return jsonify({"success": False, "error": "Không còn file zip gốc trên server. Hãy upload lại."}), 400
+
+    out_path = None
     try:
-        datasets = STATE["datasets"]
         ms = STATE["mask_store"]
-        mask_ids = ms.list_mask_ids()
-        z, h, w = STATE["num_slices"], STATE["height"], STATE["width"]
+        datasets = STATE["datasets"]
 
-        if not mask_ids:
-            return jsonify({"success": False, "error": "Chưa có mask nào để xuất."}), 400
+        custom_ids = [mid for mid in ms.list_mask_ids() if ms.meta[mid].get("status") == "custom"]
+        used = set()
+        for d in ms.pixels.values():
+            for mid in custom_ids:
+                arr = d.get(mid)
+                if arr is not None and arr.any():
+                    used.add(mid)
+        export_ids = [mid for mid in custom_ids if mid in used]
 
-        seg_array = np.zeros((z, h, w, len(mask_ids)), dtype=np.uint8)
-        has_any = False
-        for ch, mid in enumerate(mask_ids):
-            for sl in range(z):
-                arr = ms.get_mask(sl, mid)
-                if arr.any():
-                    has_any = True
-                seg_array[sl, :, :, ch] = arr
+        seg_bytes, seg_uid = None, None
+        if export_ids:
+            try:
+                seg_bytes, seg_uid = build_dicom_seg_bytes(ms, datasets, export_ids)
+            except ImportError:
+                return jsonify({"success": False, "error": "Chưa cài đặt thư viện highdicom (pip install highdicom). Trên Windows có thể cần Microsoft Visual C++ Build Tools."}), 400
 
-        if not has_any:
-            return jsonify({"success": False, "error": "Chưa có mask nào có dữ liệu để xuất."}), 400
-        try:
-            import highdicom as hd
-        except:
-            return jsonify({"success": False, "error": "Chưa cài đặt thư viện highdicom. Hãy cài đặt Microsoft Visual C++ Build Tools."}), 400
-        segment_descriptions = []
-        for i, mid in enumerate(mask_ids):
-            label_text = ms.meta[mid]["label"] or mid
-            segment_descriptions.append(
-                hd.seg.SegmentDescription(
-                    segment_number=i + 1,
-                    segment_label=label_text,
-                    segmented_property_category=Code("91723000", "SCT", "Anatomical structure"),
-                    segmented_property_type=Code("91723000", "SCT", "Anatomical structure"),
-                    algorithm_type=hd.seg.SegmentAlgorithmTypeValues.MANUAL,
-                )
-            )
+        fd, out_path = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
+        consumed = STATE.get("consumed_seg_entries") or set()
+        with zipfile.ZipFile(src_zip, "r") as zin, zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            names = set()
+            for info in zin.infolist():
+                if info.filename in consumed:      # SEG cũ đã nạp -> thay bằng SEG mới (hoặc bỏ nếu người dùng đã xóa hết mask)
+                    continue
+                names.add(info.filename)
+                zi = zipfile.ZipInfo(info.filename, info.date_time)
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                zi.external_attr = info.external_attr
+                zout.writestr(zi, b"" if info.is_dir() else zin.read(info))
+            if seg_bytes is not None:
+                seg_name = f"SEG_{seg_uid.split('.')[-1][-8:] or 'segmentation'}.dcm"
+                while seg_name in names:
+                    seg_name = "_" + seg_name
+                zi = zipfile.ZipInfo(seg_name)
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                zout.writestr(zi, seg_bytes)
 
-        seg_dataset = hd.seg.Segmentation(
-            source_images=datasets,
-            pixel_array=seg_array,
-            segmentation_type=hd.seg.SegmentationTypeValues.BINARY,
-            segment_descriptions=segment_descriptions,
-            series_instance_uid=hd.UID(),
-            series_number=999,
-            sop_instance_uid=hd.UID(),
-            instance_number=1,
-            manufacturer="CT-Segmentation-App",
-            manufacturer_model_name="FlaskSegViewer",
-            software_versions="2.0",
-            device_serial_number="0001",
-            content_label="MANUAL_SEG",
-            content_description="Segmentation nhieu mask dong tao bang cong cu web",
-        )
+        base = STATE["case_name"] or "dicom"
+        download_name = f"{base}_seg.zip" if seg_bytes is not None else f"{base}.zip"
+        resp = send_file(out_path, mimetype="application/zip", as_attachment=True, download_name=download_name)
+        resp.headers["X-Download-Name"] = quote(download_name)
+        resp.headers["X-Segments-Exported"] = str(len(export_ids))
+        _path = out_path
 
-        # Lưu thêm metadata (tên slide + status của từng mask_id) vào private tag,
-        # best-effort: nếu vì lý do gì đó không gắn được thì vẫn xuất file bình thường.
-        try:
-            extra_meta = {
-                "slide_names": {str(k): v for k, v in ms.slide_names.items()},
-                "mask_status": {mid: ms.meta[mid].get("status", "custom") for mid in mask_ids},
-                "mask_order": mask_ids,
-            }
-            seg_dataset.add_new((0x0041, 0x0010), "LO", "CTSEGAPP")
-            seg_dataset.add_new((0x0041, 0x1001), "LT", json.dumps(extra_meta)[:10240])
-        except Exception:
-            pass
-
-        buf = io.BytesIO()
-        seg_dataset.save_as(buf)
-        buf.seek(0)
-
-        return send_file(
-            buf, mimetype="application/dicom", as_attachment=True,
-            download_name=f"{STATE['case_name'] or 'segmentation'}.dcm",
-        )
+        def _rm():
+            try:
+                os.remove(_path)
+            except OSError:
+                pass
+        resp.call_on_close(_rm)
+        out_path = None      # đã giao cho call_on_close dọn
+        return resp
     except Exception as e:
-        return jsonify({"success": False, "error": f"Lỗi xuất DICOM-SEG: {str(e)}"}), 500
+        return jsonify({"success": False, "error": f"Lỗi xuất DICOM: {str(e)}"}), 500
+    finally:
+        if out_path and os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
